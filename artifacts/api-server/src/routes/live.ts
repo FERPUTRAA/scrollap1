@@ -1,0 +1,1789 @@
+import { Router, type Request, type Response } from "express";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { fetch as undiciFetch, ProxyAgent } from "undici";
+import crypto from "crypto";
+
+const execFileAsync = promisify(execFile);
+
+const liveRouter = Router();
+
+const MERCHANT_ID = process.env.HOT51_MERCHANT_ID ?? "501";
+const HOT51_BASE = process.env.HOT51_API_BASE ?? "https://api.fsccdn.com";
+const STREAM_KEY = process.env.HOT51_STREAM_KEY ?? "4ad75f5e2eb06d315ea14e8484a29e1d";
+const PROXY_URL = process.env.HOT51_PROXY_URL ?? "";
+const CF_WORKER_URL = (process.env.HOT51_CF_WORKER_URL ?? "").replace(/\/$/, "");
+
+// ─── Hot51 Native-Lib AES Keys ─────────────────────────────────────────────
+// Reversed from libnative-lib.so ARM64 using decode: byte[i] ^ (i ^ 7)
+// getCommonAesKey (idx 0) → "star@livega*963." — used for unlDefPa (room HLS URL)
+// getCommonAesIv  (idx 1) → "0608040307010502" — IV for unlDefPa
+// WS key  (idx 4) → "9216345272696329", WS iv (idx 2) → "0507060302080104"
+const HOT51_ROOM_URL_KEY = "star@livega*963.";
+const HOT51_ROOM_URL_IV  = "0608040307010502";
+const HOT51_WS_KEY       = "9216345272696329";
+const HOT51_WS_IV        = "0507060302080104";
+
+/**
+ * Decrypt a Hot51 AES-128-CBC encrypted field.
+ * Input is URL-safe OR standard Base64-encoded ciphertext.
+ * Returns the plaintext string if it looks like a valid URL, else null.
+ */
+function decryptHot51Field(ciphertext: string, key: string, iv: string): string | null {
+  try {
+    if (!ciphertext || ciphertext.length < 16) return null;
+    // Support both URL-safe (-_) and standard (+/) Base64
+    const b64 = ciphertext.replace(/-/g, "+").replace(/_/g, "/");
+    const cipherBuf = Buffer.from(b64, "base64");
+    if (cipherBuf.length === 0 || cipherBuf.length % 16 !== 0) return null;
+    const decipher = crypto.createDecipheriv(
+      "aes-128-cbc",
+      Buffer.from(key, "utf8"),
+      Buffer.from(iv, "utf8"),
+    );
+    decipher.setAutoPadding(true);
+    const plain = Buffer.concat([decipher.update(cipherBuf), decipher.final()]).toString("utf8");
+    if (plain.startsWith("http") || plain.startsWith("rtmp") || plain.startsWith("wss://")) {
+      return plain;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Seed proxy pool — SOCKS5 first (better for streaming), then HTTP
+// Jakarta proxy (108.136.140.236:44042) is pinned first — user-provided, highest priority
+const SEED_PROXY_POOL: string[] = [
+  "socks5://108.136.140.236:44042",   // Jakarta (user-provided, pinned)
+  "socks4://108.136.140.236:44042",   // same host, SOCKS4 fallback
+  "http://108.136.140.236:44042",     // same host, HTTP fallback
+  "socks5://115.178.54.210:35965",
+  "socks5://36.67.199.185:6667",
+  "socks5://36.89.147.67:61321",
+  "socks5://103.111.56.23:61790",
+  "socks5://36.67.231.35:47927",
+  "socks5://203.190.43.230:31189",
+  "socks5://103.191.218.253:8199",
+  "socks5://38.183.144.18:1080",
+  "http://103.172.35.40:8080",
+  "http://103.87.148.17:8085",
+  "http://160.19.178.44:8080",
+  "http://103.171.255.188:8080",
+  "http://43.218.138.81:3128",
+  "http://36.91.68.148:8080",
+];
+
+// Dynamic proxy pool — refreshed every 5 minutes from ProxyScrape
+let dynamicProxyPool: string[] = [...SEED_PROXY_POOL];
+let proxyPoolLastRefresh = 0;
+
+// Set of known-dead proxies (cleared every 5 minutes alongside pool refresh)
+const deadProxies = new Set<string>();
+
+const proxyAgent = PROXY_URL ? new ProxyAgent(PROXY_URL) : undefined;
+
+/** Fetch fresh Indonesian proxies from ProxyScrape API */
+async function refreshProxyPool(): Promise<void> {
+  const now = Date.now();
+  if (now - proxyPoolLastRefresh < 5 * 60_000) return;
+  proxyPoolLastRefresh = now;
+  try {
+    const res = await undiciFetch(
+      "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&country=id&timeout=1000",
+      { signal: AbortSignal.timeout(10_000) }
+    );
+    if (!res.ok) return;
+    const text = await res.text();
+    const fetched = text
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => /^(socks5?|http):\/\//i.test(l));
+    if (fetched.length > 0) {
+      // Put SOCKS5 first, then HTTP; deduplicate
+      const socks = fetched.filter(p => /^socks/i.test(p));
+      const http  = fetched.filter(p => /^http/i.test(p));
+      const merged = [...new Set([...socks, ...http, ...SEED_PROXY_POOL])];
+      if (PROXY_URL) merged.unshift(PROXY_URL);
+      dynamicProxyPool = merged;
+      deadProxies.clear();
+    }
+  } catch {
+    // silently continue with existing pool
+  }
+}
+
+// Kick off first refresh at startup (non-blocking)
+refreshProxyPool().catch(() => {});
+// Schedule periodic refresh every 5 minutes
+setInterval(() => refreshProxyPool().catch(() => {}), 5 * 60_000);
+
+/** Mark a proxy as temporarily dead */
+function markDead(proxyUrl: string): void {
+  deadProxies.add(proxyUrl);
+}
+
+/** Get proxies in priority order, skipping known-dead */
+function getLiveProxies(): string[] {
+  const pool = PROXY_URL
+    ? [PROXY_URL, ...dynamicProxyPool.filter(p => p !== PROXY_URL)]
+    : dynamicProxyPool;
+  const live = pool.filter(p => !deadProxies.has(p));
+  // If all dead, reset and return full pool (retry)
+  if (live.length === 0) {
+    deadProxies.clear();
+    return pool;
+  }
+  return live;
+}
+
+function getProxyAgent(proxyUrl: string): ProxyAgent {
+  return new ProxyAgent(proxyUrl);
+}
+
+const ZEGO_APP_ID = 975_360_885;
+const ZEGO_APP_SIGN = "968077d0acc44519d02de6d9c5ed7b0885479810224e9b3ac1c59d20dc25b009";
+
+// CDN nodes from APK analysis: cdnsi.com, livcdn.com, hx.baccdn.com (secondary CDN)
+const CDN_NODES = ["pull.cdnsi", "cdnsi", "hx.baccdn", "bcdn5", "bcdn1", "bcdn2", "bcdn3", "bcdn4"];
+// baccdn.com = secondary CDN found in APK assets — may bypass some geo restrictions
+
+// API paths extracted directly from APK smali: com/example/obs/player/component/net/Api.smali
+const API = {
+  // Live room listing
+  homeLives:        `/plr/v4/public/live/lrl`,                         // primary (homeLives)
+  liveHomePageLids: `/plr/v4/public/live/lids`,                        // get live IDs list
+  getHotLiveList:   `/plr/zbliv/public/live/app/liveCenter`,           // hot live center
+  liveCenterList:   `/plr/scrolliv/live/app/liveCenter/list`,          // scrolliv live center
+  liveCenterLids:   `/plr/scrolliv/live/app/liveCenter/lids`,          // scrolliv live IDs
+  roomIndex:        `/plr/v3/public/live/room-index`,                  // fallback room list (v3)
+
+  // Room info & stream
+  getRoomInfo:      `/plr/zbliv/v3/public/live/room-info`,             // room info (APK getRoomInfo)
+  enterRoomV3:      `/plr/v3/public/live/enter-room`,                  // enter room v3
+  enterRoomV4:      `/plr/v4/public/live/enter-room`,                  // enter room v4
+  swipeSwitch:      `/plr/zbliv/v3/public/live/swipe-switch`,          // swipe to next room
+  liveNext:         `/plr/scrolliv/live/next`,                         // next live
+
+  // Auth
+  login:            `/auth-service/oauth/token`,                       // login with credentials
+  sendOtp:          `/plr/grcen/verify-code/v1/centralized/phone`,     // send OTP
+  verifyOtp:        `/plr/grcen/verify-code/verify/phone`,             // verify OTP
+  userCenter:       `/plr/grcen/players/center`,                       // user info
+  logout:           `/plr/grcen/players/logout`,                       // logout
+
+  // Gifts & ranking (confirmed in Deanur smali_classes2)
+  getGiftList:         `/plr/gift/viibo/list`,                         // gift list (primary)
+  getGiftList2:        `/plr/gift/get/list`,                           // gift list (secondary)
+  getPackageGiftList:  `/plr/gift/package/list`,                       // gift package list
+  sendGift:            `/plr/gift/send`,                               // send gift to anchor
+  sendPackageGift:     `/plr/gift/package/send`,                       // send package gift
+  getLiveRankList:     `/plr/financemo/gift/get/rank/list`,            // rank list
+
+  // Stream quality
+  liveRoomStreamRate:  `/plr/zbliv/v3/public/live/room-cr`,           // stream rate/quality
+
+  // Startup & server config (from Deanur smali_classes2)
+  serverStatus:        `/plr/merchants/get/config`,                    // server config/status
+  splashInfo:          `/plr/v3/aggregates/startup-info/new`,          // startup info
+  upgrade:             `/plr/app-versions/client/latest`,              // version check
+};
+
+
+// Headers extracted from real APK traffic capture (Cronet HTTP interceptor + smali analysis):
+// GET endpoints: no Authorization needed (server doesn't require it)
+// POST endpoints: Authorization: Basic required even for guest (app-player Basic auth)
+// Extra headers confirmed from capture: dev-type, system-version, versionCode, time-zone
+// locale-language: ENU (not "id") — actual value the APK sends
+const GUEST_AC = process.env.HOT51_GUEST_AC ?? "2345689";
+// Device ID from real APK traffic capture (Realme RMX2030, Android 10)
+const GUEST_DEVICE = process.env.HOT51_DEVICE ?? "08b55ddbd0debc1fa8cdc7127240d402";
+// Basic auth for app-player (not user login) — present in ALL APK POST requests
+const APP_BASIC_AUTH = "Basic YXBwLXBsYXllcjphcHBQbGF5ZXIyMDIxKjk2My4=";
+
+// Shared base headers (used for both GET and POST)
+const BASE_HEADERS: Record<string, string> = {
+  merchantId: MERCHANT_ID,
+  ac: GUEST_AC,
+  username: "",
+  device: GUEST_DEVICE,
+  area: "ID",
+  "locale-language": "ENU",
+  "client-type": "1",
+  "dev-type": "android_realme_RMX2030",
+  "system-version": "10",
+  versionCode: "590",
+  "time-zone": "GMT+07:00",
+  "User-Agent": "Cronet/590 (Linux; U; Android 10; en; RMX2030; Build/QKQ1.200209.002; Cronet/119.0.6045.31)",
+  Accept: "*/*",
+  Connection: "keep-alive",
+};
+
+// GET request headers — no Authorization, no Content-Type
+const APP_HEADERS: Record<string, string> = { ...BASE_HEADERS };
+
+// Sign values captured from real APK traffic (Realme RMX2030, device 08b55dbd...).
+// sign = MD5(body_content + JNI_SALT) — salt is embedded in native lib, not known.
+// For empty-body POST (Content-Length: 0): sign is constant for this device.
+// For non-empty body: sign changes with body. We use captured per-body-type values as
+// best-effort constants — they may still work if the server does a lenient check.
+const SIGN_EMPTY_BODY      = "11f569ed792da4e0cff8a393534a5bf2"; // empty / form-urlencoded
+const SIGN_LIVE_NEXT       = "c01ca7f79119440f05281127fda04637"; // scrolliv/live/next body type
+const SIGN_ROOM_INFO       = "1867b90749947a889f6523f9097a70c2"; // room-info body type
+
+/** Pick captured sign for the given JSON body (best-effort — may differ per dynamic ID) */
+function signForBody(body: string): string {
+  if (!body || body === "{}") return SIGN_EMPTY_BODY;
+  if (body.startsWith('{"aid"')) return SIGN_LIVE_NEXT;
+  if (body.startsWith('{"anchorId"')) return SIGN_ROOM_INFO;
+  return SIGN_EMPTY_BODY; // fallback
+}
+
+// POST request headers — includes Authorization: Basic (app-player) + Content-Type + sign
+const POST_HEADERS: Record<string, string> = {
+  ...BASE_HEADERS,
+  Authorization: APP_BASIC_AUTH,
+  "Content-Type": "application/json",
+  sign: SIGN_EMPTY_BODY,
+};
+
+// OTP/login endpoints use Basic auth only for token endpoint
+const OTP_HEADERS: Record<string, string> = {
+  ...POST_HEADERS,
+};
+
+/** Add ?t=<unix_timestamp> to a URL (required by HOT51 GET endpoints) */
+function withTimestamp(url: string): string {
+  const t = Math.floor(Date.now() / 1000);
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}t=${t}`;
+}
+
+interface Session {
+  ac: string;
+  sign: string;
+  username: string;
+  phone?: string;
+}
+
+let session: Session | null = null;
+
+if (process.env.HOT51_AC && process.env.HOT51_SIGN) {
+  session = {
+    ac: process.env.HOT51_AC,
+    sign: process.env.HOT51_SIGN,
+    username: process.env.HOT51_USERNAME ?? "",
+  };
+}
+
+/** Headers for GET requests (no Authorization, no Content-Type) */
+function getGuestGetHeaders(): Record<string, string> {
+  return APP_HEADERS;
+}
+
+/** Headers for POST requests (includes Authorization: Basic, Content-Type, body-aware sign) */
+function getPostHeaders(body?: string): Record<string, string> {
+  const sign = session ? session.sign : signForBody(body ?? "");
+  if (!session) return { ...POST_HEADERS, sign };
+  return {
+    ...POST_HEADERS,
+    username: session.username,
+    ac: session.ac,
+    sign,
+  };
+}
+
+/** @deprecated Use getPostHeaders(body) for POST, getGuestGetHeaders() for GET */
+function getUserHeaders(body?: string): Record<string, string> {
+  return getPostHeaders(body);
+}
+
+const CDNSI_NODES  = new Set(["pull.cdnsi", "cdnsi"]);
+const BACCDN_NODES = new Set(["hx.baccdn"]);
+
+function nodeToDomain(node: string): string {
+  if (CDNSI_NODES.has(node))  return `${node}.com`;
+  if (BACCDN_NODES.has(node)) return `${node}.com`;   // hx.baccdn.com (APK secondary CDN)
+  return `${node}.livcdn.com`;
+}
+
+function buildCDNUrls(roomId: string, anchorId?: string): string[] {
+  const urls: string[] = [];
+  const key = STREAM_KEY;
+  for (const node of CDN_NODES) {
+    urls.push(`https://${nodeToDomain(node)}/live/${MERCHANT_ID}_${roomId}_${key}.flv`);
+  }
+  if (anchorId && anchorId !== roomId) {
+    urls.push(`https://pull.cdnsi.com/live/${MERCHANT_ID}_${anchorId}_${key}.flv`);
+  }
+  return urls;
+}
+
+function buildStreamUrl(roomId: string): string {
+  return `https://pull.cdnsi.com/live/${MERCHANT_ID}_${roomId}_${STREAM_KEY}.flv`;
+}
+
+function proxyFlagFor(proxyUrl: string): string[] {
+  if (!proxyUrl) return [];
+  if (/^socks5/i.test(proxyUrl)) return ["--socks5", proxyUrl.replace(/^socks5:\/\//i, "")];
+  if (/^socks4a/i.test(proxyUrl)) return ["--socks4a", proxyUrl.replace(/^socks4a:\/\//i, "")];
+  if (/^socks/i.test(proxyUrl)) return ["--socks4", proxyUrl.replace(/^socks4:\/\//i, "").replace(/^socks:\/\//i, "")];
+  return ["--proxy", proxyUrl];
+}
+
+function proxyFlag(): string[] {
+  const live = getLiveProxies();
+  return live.length > 0 ? proxyFlagFor(live[0]) : [];
+}
+
+async function curlPost(
+  url: string,
+  headers: Record<string, string>,
+  body: string,
+  timeoutMs = 20_000,
+): Promise<string> {
+  const headerArgs = Object.entries(headers).flatMap(([k, v]) => ["-H", `${k}: ${v}`]);
+  const args = [
+    "-s", "--compressed",
+    "--max-time", String(Math.ceil(timeoutMs / 1000)),
+    "--connect-timeout", "10",
+    ...proxyFlag(),
+    "-X", "POST",
+    ...headerArgs,
+    "-d", body,
+    url,
+  ];
+  const { stdout } = await execFileAsync("curl", args, { timeout: timeoutMs + 3_000 });
+  return stdout;
+}
+
+/** Single fetch attempt — resolves with parsed JSON or rejects */
+async function attemptFetch(
+  url: string,
+  options: { method: string; headers: Record<string, string>; body?: string },
+  dispatcher: ProxyAgent | undefined,
+  timeoutMs: number,
+): Promise<unknown> {
+  const fetchOpts: Parameters<typeof undiciFetch>[1] = {
+    method: options.method,
+    headers: options.headers,
+    body: options.body,
+    signal: AbortSignal.timeout(timeoutMs),
+  };
+  if (dispatcher) fetchOpts.dispatcher = dispatcher;
+  const res = await undiciFetch(url, fetchOpts);
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`Bad JSON (HTTP ${res.status}): ${text.slice(0, 200)}`);
+  }
+}
+
+async function hotFetch(
+  url: string,
+  options: { method: string; headers: Record<string, string>; body?: string; timeoutMs?: number }
+): Promise<unknown> {
+  const totalTimeout = options.timeoutMs ?? 15_000;
+  // Per-attempt timeout: fast enough to try many proxies within total timeout
+  const perAttemptMs = Math.min(5_000, Math.floor(totalTimeout * 0.4));
+
+  // STEP 1: Try direct connection first (fastest, works if server isn't geo-blocked)
+  try {
+    return await attemptFetch(url, options, undefined, perAttemptMs);
+  } catch {
+    // direct failed — try proxies
+  }
+
+  // STEP 2: Race up to 5 proxies at once in parallel batches for speed
+  const liveProxies = getLiveProxies();
+  const BATCH = 5;
+
+  for (let i = 0; i < liveProxies.length && i < 20; i += BATCH) {
+    const batch = liveProxies.slice(i, i + BATCH);
+    // Race the batch — first success wins, others are abandoned
+    const result = await Promise.any(
+      batch.map(async (proxyUrl) => {
+        const dispatcher = getProxyAgent(proxyUrl);
+        try {
+          const data = await attemptFetch(url, options, dispatcher, perAttemptMs);
+          return data;
+        } catch (e) {
+          markDead(proxyUrl);
+          throw e;
+        }
+      })
+    ).catch(() => null);
+
+    if (result !== null) return result;
+  }
+
+  // STEP 3: Last resort — longer direct attempt
+  try {
+    return await attemptFetch(url, options, undefined, totalTimeout);
+  } catch (e) {
+    throw e instanceof Error ? e : new Error(String(e));
+  }
+}
+
+// Fields extracted from APK smali: AnchorConnectedEvent, MqttSubRoomInfo$Result
+// The room list API response may already contain flvStreamUrl / rtmpStreamUrl per room
+interface RoomRecord {
+  id: string;
+  anchorId?: string;
+  liveId?: string;
+  anchorNickname?: string;
+  onlineCount?: number;
+  gameName?: string;
+  gameType?: number;
+  coverUrl?: string;
+  anchorAvatarUrl?: string;
+  liveName?: string;
+  area?: string;
+  // APK stream URL fields (FLV)
+  flvStreamUrl?: string;
+  rtmpStreamUrl?: string;
+  pullAddr?: string;
+  pullUrl?: string;
+  pullFlvUrl?: string;
+  playUrl?: string;
+  streamUrl?: string;
+  liveUrl?: string;
+  // APK stream URL fields (HLS) — pull.cdnsi.com/live/*.m3u8
+  hlsStreamUrl?: string;
+  hlsUrl?: string;
+  pullHlsUrl?: string;
+  m3u8Url?: string;
+  hlsAddr?: string;
+}
+
+interface ProcessedRoom {
+  id: string;
+  anchorId: string;
+  liveId: string;
+  name: string;
+  viewers: number;
+  cover: string;
+  avatar: string;
+  liveName: string;
+  streamUrl: string;   // FLV CDN URL
+  hlsUrl: string;      // HLS CDN URL (primary — HOT51 app uses HLS .m3u8)
+  streamProxyUrl: string;
+  zegoStreamId: string;
+  hasAuth: boolean;
+}
+
+const ALL_STREAM_FIELDS = [
+  "flvStreamUrl", "pullFlvUrl", "pullUrl", "pullAddr",
+  "playUrl", "liveUrl", "streamUrl",
+  "hlsStreamUrl", "hlsUrl", "pullHlsUrl", "m3u8Url", "hlsAddr",
+];
+
+/** Build HLS (.m3u8) URL — HOT51 app primary format: pull.cdnsi.com/live/{mid}_{liveId}_{token}.m3u8 */
+function buildHlsUrl(roomId: string): string {
+  return `https://pull.cdnsi.com/live/${MERCHANT_ID}_${roomId}_${STREAM_KEY}.m3u8`;
+}
+
+/** Pick best HLS URL from room record; construct from FLV URL if needed */
+function pickHlsUrl(r: RoomRecord, liveId: string): string {
+  // Explicit HLS fields first
+  const hlsCandidates = [r.hlsStreamUrl, r.hlsUrl, r.pullHlsUrl, r.m3u8Url, r.hlsAddr]
+    .filter((v): v is string => !!v && v.startsWith("http") && (v.includes(".m3u8") || v.includes("hls")));
+  if (hlsCandidates.length > 0) return hlsCandidates[0];
+
+  // Derive HLS from FLV URL (change extension) — CDN supports both
+  const flvCandidates = [r.flvStreamUrl, r.pullFlvUrl, r.pullUrl, r.pullAddr, r.playUrl, r.liveUrl, r.streamUrl]
+    .filter((v): v is string => !!v && v.startsWith("http") && v.includes(".flv"));
+  if (flvCandidates.length > 0) return flvCandidates[0].replace(/\.flv$/, ".m3u8");
+
+  return buildHlsUrl(liveId);
+}
+
+/** Pick the best FLV stream URL from a room record (APK field priority order) */
+function pickStreamUrl(r: RoomRecord): string {
+  const rr = r as unknown as Record<string, unknown>;
+  const candidates = ALL_STREAM_FIELDS
+    .map(f => rr[f] as string | undefined)
+    .filter((v): v is string => !!v && (v.startsWith("http") || v.startsWith("rtmp")) && v.includes("flv"));
+
+  const anyHttp = ALL_STREAM_FIELDS
+    .map(f => rr[f] as string | undefined)
+    .filter((v): v is string => !!v && (v.startsWith("http") || v.startsWith("rtmp")));
+
+  return candidates[0] ?? anyHttp[0] ?? buildStreamUrl(r.id);
+}
+
+function mapRoom(r: RoomRecord): ProcessedRoom {
+  const anchorId = r.anchorId ?? r.id;
+  const liveId   = r.liveId   ?? r.id;
+  return {
+    id: r.id,
+    anchorId,
+    liveId,
+    name:     r.anchorNickname ?? "",
+    viewers:  r.onlineCount    ?? 0,
+    cover:    r.coverUrl        ?? "",
+    avatar:   r.anchorAvatarUrl ?? r.coverUrl ?? "",
+    liveName: r.liveName        ?? "",
+    streamUrl:      pickStreamUrl(r),
+    hlsUrl:         pickHlsUrl(r, liveId),
+    streamProxyUrl: `/api/stream-proxy?roomId=${r.id}&anchorId=${anchorId}&liveId=${liveId}`,
+    // Use liveId for Zego stream — lid from room-info is the actual Zego stream/room ID
+    zegoStreamId:   `${MERCHANT_ID}_${liveId}`,
+    hasAuth: !!session,
+  };
+}
+
+function extractRooms(data: unknown, depth = 0): { records: RoomRecord[]; total: number } {
+  if (!data || typeof data !== "object" || depth > 5) return { records: [], total: 0 };
+  if (Array.isArray(data)) {
+    return { records: data as RoomRecord[], total: data.length };
+  }
+  const d = data as Record<string, unknown>;
+
+  if (Array.isArray(d.records)) {
+    return { records: d.records as RoomRecord[], total: Number(d.total ?? d.records.length) };
+  }
+  if (Array.isArray(d.list)) {
+    return { records: d.list as RoomRecord[], total: Number(d.total ?? d.list.length) };
+  }
+  if (d.data !== undefined) {
+    const nested = extractRooms(d.data, depth + 1);
+    if (nested.records.length > 0) return nested;
+  }
+  if (d.result !== undefined) {
+    const nested = extractRooms(d.result, depth + 1);
+    if (nested.records.length > 0) return nested;
+  }
+  return { records: [], total: 0 };
+}
+
+function isApiOk(data: unknown): boolean {
+  if (!data || typeof data !== "object") return false;
+  const d = data as Record<string, unknown>;
+  if (d.code === 200) return true;
+  if (d.errorCode && d.errorCode !== "200") return false;
+  if (d.data && typeof d.data === "object") {
+    const nested = d.data as Record<string, unknown>;
+    if (nested.errorCode) return false;
+  }
+  if (d.code === undefined && d.errorCode === undefined) return true;
+  return false;
+}
+
+let cache: { ts: number; rooms: ProcessedRoom[]; total: number } | null = null;
+const CACHE_TTL = 2 * 60_000;
+
+/**
+ * Unwrap HOT51 API response envelope.
+ * The API returns either a raw array/object OR {"code":200,"data":[...]} wrapper.
+ * Both formats must be supported.
+ */
+function unwrapHot51(data: unknown): unknown {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return data;
+  const d = data as Record<string, unknown>;
+  // {"code":200,"data":...} or {"errorCode":"0","data":...}
+  if (d.data !== undefined && (d.code === 200 || d.code === "200" || d.errorCode === "0" || d.errorCode === 0)) {
+    return d.data;
+  }
+  return data;
+}
+
+/** Fetch anchor IDs from the working GET /lids endpoint (no auth required) */
+async function fetchAnchorIds(area = "ID", pageSize = 100): Promise<Array<{ aid: string; area: string }>> {
+  const url = withTimestamp(
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterLids}?labelId=1&merchantId=${MERCHANT_ID}&memArea=${area}&pageSize=${pageSize}`
+  );
+  const raw = await hotFetch(url, { method: "GET", headers: getGuestGetHeaders(), timeoutMs: 15_000 });
+  const data = unwrapHot51(raw);
+  if (Array.isArray(data)) {
+    return (data as Array<{ aid: string; area: string }>).filter(x => x.aid);
+  }
+  return [];
+}
+
+/** Fetch cover URLs for a batch of anchor IDs using swipeSwitch */
+async function fetchSwipeSwitchBatch(anchorId: string, type = 0): Promise<Array<{ anchorId: string; coverUrl: string; living: boolean }>> {
+  const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.swipeSwitch}`);
+  const raw = await hotFetch(url, {
+    method: "POST",
+    headers: getPostHeaders(),
+    body: JSON.stringify({ anchorId, type }),
+    timeoutMs: 10_000,
+  });
+  const data = unwrapHot51(raw);
+  if (Array.isArray(data)) return data as Array<{ anchorId: string; coverUrl: string; living: boolean }>;
+  return [];
+}
+
+/** Build cover map by calling swipeSwitch with multiple seeds in parallel */
+async function buildCoverMap(anchorIds: string[]): Promise<Map<string, string>> {
+  // Sample seeds spread across the anchor list — each call returns 3 covers
+  // Use up to 20 seeds (type 0 and 1 alternate) for broader coverage
+  const seeds: Array<[string, number]> = [];
+  const MAX_SEEDS = 20;
+  const step = Math.max(1, Math.floor(anchorIds.length / (MAX_SEEDS / 2)));
+  for (let i = 0; i < anchorIds.length && seeds.length < MAX_SEEDS; i += step) {
+    seeds.push([anchorIds[i], 0]);
+    if (i + Math.floor(step / 2) < anchorIds.length && seeds.length < MAX_SEEDS) {
+      seeds.push([anchorIds[i + Math.floor(step / 2)], 1]);
+    }
+  }
+
+  const results = await Promise.allSettled(
+    seeds.map(([aid, type]) => fetchSwipeSwitchBatch(aid, type))
+  );
+
+  const coverMap = new Map<string, string>();
+  for (const r of results) {
+    if (r.status === "fulfilled") {
+      for (const { anchorId, coverUrl } of r.value) {
+        if (coverUrl && !coverMap.has(anchorId)) {
+          coverMap.set(anchorId, coverUrl);
+        }
+      }
+    }
+  }
+  return coverMap;
+}
+
+interface RoomInfoResult {
+  name: string;         // ann = anchor nickname
+  viewers: number;      // wuc = watch user count (current session viewers)
+  liveId: string;       // lid = actual live/room ID used by Zego (may differ from anchorId)
+  avatar?: string;      // ahp / cu = anchor head photo URL
+  pullAddr?: string;    // FLV stream URL (null for guests, present with auth)
+  pullAddr265?: string; // HLS stream URL (null for guests, present with auth)
+  hlsUrl?: string;      // decrypted unlDefPa — real HLS URL (bcdn5.livcdn.com) always present
+  wsUrl?: string;       // decrypted wsu — WebSocket URL for live events
+  liveName?: string;    // ln = room title set by the streamer
+  fanCount?: number;    // fansNum = fan count
+  gameName?: string;    // gn = game being played
+}
+
+/** Fetch real room metadata from room-info API */
+async function fetchRoomInfo(anchorId: string): Promise<RoomInfoResult | null> {
+  const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getRoomInfo}`);
+  const body = JSON.stringify({ anchorId, isSupportH265: true, spH5: 1 });
+  try {
+    const raw = await hotFetch(url, {
+      method: "POST",
+      headers: getPostHeaders(body),
+      body,
+      timeoutMs: 8_000,
+    });
+    const d = unwrapHot51(raw) as Record<string, unknown>;
+    if (!d || typeof d !== "object" || Array.isArray(d)) return null;
+    const liveId = (d.lid as string) || anchorId;
+    // ann = anchor nickname, irduc = short nickname displayed in UI
+    const name = (d.ann as string) || (d.irduc as string) || "";
+    // wuc = watch user count (current viewers), fallback to oc (online count)
+    const viewers = Number(d.wuc ?? d.oc ?? 0);
+    // ahp = anchor head photo, cu = cover URL
+    const avatar = (d.ahp as string) || (d.cu as string) || undefined;
+
+    // unlDefPa — AES-128-CBC encrypted HLS URL for guest viewers (always present)
+    // Decrypted using keys reversed from libnative-lib.so: key=getCommonAesKey, iv=getCommonAesIv
+    const unlDefPa = (d.unlDefPa as string) || undefined;
+    const hlsUrl = unlDefPa
+      ? (decryptHot51Field(unlDefPa, HOT51_ROOM_URL_KEY, HOT51_ROOM_URL_IV) ?? undefined)
+      : undefined;
+
+    // wsu — AES-128-CBC encrypted WebSocket URL
+    const wsuRaw = (d.wsu as string) || undefined;
+    const wsUrl = wsuRaw
+      ? (decryptHot51Field(wsuRaw, HOT51_WS_KEY, HOT51_WS_IV) ?? undefined)
+      : undefined;
+
+    return {
+      name,
+      viewers,
+      liveId,
+      avatar,
+      pullAddr:    (d.pullAddr    as string) || undefined,
+      pullAddr265: (d.pullAddr265 as string) || undefined,
+      hlsUrl,
+      wsUrl,
+      liveName:    (d.ln as string) || undefined,
+      fanCount:    d.fansNum ? Number(d.fansNum) : undefined,
+      gameName:    (d.gn as string) || undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Batch-enrich rooms with real names, viewer counts, and live IDs from room-info API */
+async function enrichRooms(
+  records: RoomRecord[],
+  maxRooms = 30
+): Promise<RoomRecord[]> {
+  const toEnrich = records.slice(0, maxRooms);
+  const rest = records.slice(maxRooms);
+
+  // Fetch room-info for first batch in parallel (concurrency-limited)
+  const BATCH = 8; // max parallel requests
+  const enriched: RoomRecord[] = [];
+  for (let i = 0; i < toEnrich.length; i += BATCH) {
+    const chunk = toEnrich.slice(i, i + BATCH);
+    const results = await Promise.allSettled(
+      chunk.map(r => fetchRoomInfo(r.anchorId ?? r.id))
+    );
+    for (let j = 0; j < chunk.length; j++) {
+      const r = chunk[j];
+      const settled = results[j];
+      const info = settled.status === "fulfilled" ? settled.value : null;
+      if (info) {
+        enriched.push({
+          ...r,
+          liveId: info.liveId,
+          anchorNickname: info.name || r.anchorNickname,
+          onlineCount: info.viewers || r.onlineCount || 0,
+          liveName: info.liveName || r.liveName,
+          gameName: info.gameName || r.gameName,
+          // Avatar from ahp/cu fields in room-info
+          ...(info.avatar && { anchorAvatarUrl: info.avatar }),
+          // If room-info returned a stream URL, use it
+          ...(info.pullAddr    && { pullAddr:    info.pullAddr }),
+          ...(info.pullAddr265 && { hlsStreamUrl: info.pullAddr265 }),
+          // unlDefPa decrypted HLS URL — always present for guest viewers (highest priority)
+          ...(info.hlsUrl && { hlsStreamUrl: info.hlsUrl }),
+        });
+      } else {
+        enriched.push(r);
+      }
+    }
+  }
+  return [...enriched, ...rest];
+}
+
+async function fetchLiveRooms(): Promise<{ rooms: ProcessedRoom[]; total: number }> {
+  const now = Date.now();
+  if (cache && now - cache.ts < CACHE_TTL) return cache;
+
+  let records: RoomRecord[] = [];
+  let total = 0;
+
+  // STRATEGY 1 (primary — confirmed working, no auth required):
+  // GET /lids → anchor IDs, enrich with cover URLs (swipeSwitch) + room metadata (room-info)
+  try {
+    const [idListID, idListVN] = await Promise.all([
+      fetchAnchorIds("ID", 80).catch(() => []),
+      fetchAnchorIds("VN", 40).catch(() => []),
+    ]);
+
+    const allAnchors = [...idListID, ...idListVN];
+
+    if (allAnchors.length > 0) {
+      // Build base records
+      const baseRecords: RoomRecord[] = allAnchors.map(({ aid, area }) => ({
+        id: aid,
+        anchorId: aid,
+        liveId: aid,
+        area,
+        coverUrl: "",
+        anchorNickname: "",
+        onlineCount: 0,
+      }));
+
+      // Parallel: get covers (swipeSwitch) + enrich first 30 with room-info
+      const [coverMap, enrichedRecords] = await Promise.all([
+        buildCoverMap(allAnchors.map(a => a.aid)).catch(() => new Map<string, string>()),
+        enrichRooms(baseRecords, 30).catch(() => baseRecords),
+      ]);
+
+      // Apply cover map to all records
+      records = enrichedRecords.map(r => ({
+        ...r,
+        coverUrl: coverMap.get(r.anchorId ?? r.id) ?? r.coverUrl ?? "",
+      }));
+      total = records.length;
+    }
+  } catch {
+    // fall through to legacy POST endpoints
+  }
+
+  // STRATEGY 2 (fallback — POST endpoints, may need auth for some):
+  if (records.length === 0 && session) {
+    const roomListEndpoints = [
+      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.homeLives}`,      body: JSON.stringify({ area: "ID", page: 1, pageSize: 200 }) },
+      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterList}`, body: JSON.stringify({ area: "ID", page: 1, pageSize: 200 }) },
+      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.getHotLiveList}`, body: JSON.stringify({ area: "ID", page: 1, pageSize: 200 }) },
+    ];
+
+    for (const ep of roomListEndpoints) {
+      try {
+        const data = await hotFetch(withTimestamp(ep.url), {
+          method: "POST",
+          headers: getUserHeaders(),
+          body: ep.body,
+          timeoutMs: 20_000,
+        });
+        const extracted = extractRooms(data);
+        if (extracted.records.length > 0) {
+          records = extracted.records;
+          total = extracted.total;
+          break;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  if (records.length === 0) {
+    cache = { ts: now - CACHE_TTL + 30_000, rooms: [], total: 0 };
+    return { rooms: [], total: 0 };
+  }
+
+  // Sort: rooms with covers first (better UX when scrolling)
+  const allRooms = records.map(mapRoom);
+  const withCover = allRooms.filter(r => r.cover);
+  const noCover = allRooms.filter(r => !r.cover);
+  const rooms = [...withCover, ...noCover];
+  cache = { ts: now, rooms, total: total || rooms.length };
+  return cache;
+}
+
+async function getRealStreamUrl(roomId: string, anchorId: string, liveId?: string): Promise<string | null> {
+  // Also scan HLS stream URL fields — Hot51 app primarily uses HLS (.m3u8), not FLV
+  const STREAM_FIELDS = [
+    "pullAddr", "pullAddr265", "pullAddress", "pullUrl", "pullFlvUrl", "pullHlsUrl",
+    "flvUrl", "hlsUrl", "m3u8Url", "hlsAddr", "playUrl", "streamUrl",
+    "flvStreamUrl", "hlsStreamUrl", "liveUrl", "rtmpStreamUrl",
+  ];
+
+  const scan = (obj: unknown, depth = 0): string | null => {
+    if (!obj || typeof obj !== "object" || depth > 8) return null;
+    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+      if (
+        STREAM_FIELDS.some(f => k.toLowerCase().includes(f.toLowerCase())) &&
+        typeof v === "string" && v.length > 10 &&
+        (v.startsWith("http") || v.startsWith("rtmp")) &&
+        (v.includes(".flv") || v.includes(".m3u8") || v.includes("/live/"))
+      ) {
+        return v;
+      }
+      if (v && typeof v === "object") {
+        const found = scan(v, depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+
+  // Endpoints from APK smali analysis — body formats match exact APK captured traffic
+  const lid = liveId ?? roomId;
+  const endpoints = [
+    // PRIMARY: room-info — body confirmed from real APK capture (isSupportH265+spH5 required)
+    { body: JSON.stringify({ anchorId, isSupportH265: true, spH5: 1 }), url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getRoomInfo}`) },
+    // Enter-room v4
+    { body: JSON.stringify({ anchorId, isSupportH265: true, spH5: 1 }), url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.enterRoomV4}`) },
+    // Enter-room v3 (fallback)
+    { body: JSON.stringify({ anchorId, roomId, liveId: lid }),           url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.enterRoomV3}`) },
+    // swipe-switch — cover+living only, but may contain stream fields
+    { body: JSON.stringify({ anchorId, type: 0 }),                       url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.swipeSwitch}`) },
+    // liveRoomStreamRate — stream quality/rate info
+    { body: JSON.stringify({ anchorId, liveId: lid }),                   url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.liveRoomStreamRate}`) },
+  ];
+
+  /** Recursively find and decrypt the `unlDefPa` encrypted HLS field */
+  const scanUnlDefPa = (obj: unknown, depth = 0): string | null => {
+    if (!obj || typeof obj !== "object" || depth > 8) return null;
+    const d = obj as Record<string, unknown>;
+    if (typeof d.unlDefPa === "string" && d.unlDefPa.length > 20) {
+      const dec = decryptHot51Field(d.unlDefPa, HOT51_ROOM_URL_KEY, HOT51_ROOM_URL_IV);
+      if (dec) return dec;
+    }
+    for (const v of Object.values(d)) {
+      if (v && typeof v === "object") {
+        const found = scanUnlDefPa(v, depth + 1);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+
+  for (const ep of endpoints) {
+    try {
+      const data = await hotFetch(ep.url, {
+        method: "POST",
+        headers: getPostHeaders(ep.body),
+        body: ep.body,
+        timeoutMs: 10_000,
+      }) as Record<string, unknown>;
+      // Skip only hard error codes, not 0 (success) or missing code
+      if (data.errorCode && Number(data.errorCode) !== 0) continue;
+      // 1. Check unlDefPa (encrypted HLS URL — always present for guest viewers)
+      const decryptedUrl = scanUnlDefPa(data);
+      if (decryptedUrl) return decryptedUrl;
+      // 2. Check standard URL fields (pullAddr, hlsUrl, etc.)
+      const found = scan(data);
+      if (found) return found;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+/**
+ * GET /hot51-proxy
+ * CORS-enabled transparent proxy to Hot51 API for frontend direct calls.
+ * Sends the request from the client's browser (with CORS headers) through our backend,
+ * but adds all required Hot51 headers. Frontend passes ?path=... and body via POST.
+ *
+ * NOTE: This endpoint is for non-geo-restricted access patterns only.
+ * For real stream fetching, the user must be in Indonesia or use a proxy.
+ */
+liveRouter.options("/hot51-proxy", (_req: Request, res: Response) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  res.sendStatus(204);
+});
+
+liveRouter.post("/hot51-proxy", async (req: Request, res: Response) => {
+  const { path: apiPath, body: reqBody } = req.body as { path?: string; body?: unknown };
+  if (!apiPath) { res.status(400).json({ error: "path required" }); return; }
+
+  const bodyStr = reqBody ? JSON.stringify(reqBody) : "";
+  const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${apiPath}`);
+
+  try {
+    const data = await hotFetch(url, {
+      method: "POST",
+      headers: getPostHeaders(bodyStr),
+      body: bodyStr || undefined,
+      timeoutMs: 12_000,
+    });
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.json({ success: true, data });
+  } catch (err) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.status(502).json({ success: false, error: String(err) });
+  }
+});
+
+liveRouter.get("/live-rooms", async (req: Request, res: Response) => {
+  const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "30"), 10)));
+  const offset = Math.max(0, parseInt(String(req.query.offset ?? "0"), 10));
+
+  try {
+    const { rooms, total } = await fetchLiveRooms();
+    const sliced = rooms.slice(offset, offset + limit).map(r => ({
+      ...r,
+      hasAuth: !!session,
+    }));
+    res.json({ success: true, rooms: sliced, total, source: "api", hasAuth: !!session });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Gagal mengambil data";
+    req.log.error({ err, proxy: PROXY_URL || "none" }, "live-rooms failed");
+    res.status(502).json({ success: false, error: message, proxy: PROXY_URL ? "set" : "not set" });
+  }
+});
+
+liveRouter.get("/room-info", async (req: Request, res: Response) => {
+  const roomId = String(req.query.roomId ?? "");
+  const anchorId = String(req.query.anchorId ?? "");
+  const liveId = String(req.query.liveId ?? "");
+  if (!roomId) { res.status(400).json({ success: false, error: "Missing ?roomId" }); return; }
+
+  const realUrl = await getRealStreamUrl(roomId, anchorId, liveId);
+
+  res.json({
+    success: true,
+    roomId,
+    streamUrl: realUrl ?? buildStreamUrl(roomId),
+    hasAuth: !!session,
+    fromApi: !!realUrl,
+  });
+});
+
+liveRouter.get("/zego-config", (_req: Request, res: Response) => {
+  res.json({
+    appId: ZEGO_APP_ID,
+    appSign: ZEGO_APP_SIGN,
+    merchantId: MERCHANT_ID,
+  });
+});
+
+// Official Zego Token04 format (matches Zego's server-side SDK):
+// AES-256-CBC, random IV packed in binary data alongside ciphertext
+// Structure: expire(8) + iv_len(2) + iv(16) + enc_len(2) + enc
+function generateZegoToken(appId: number, userId: string, appSign: string, expireSeconds = 3600): string {
+  const expire = Math.floor(Date.now() / 1000) + expireSeconds;
+  const nonce = crypto.randomBytes(8).toString("base64");
+
+  const content = JSON.stringify({
+    app_id: appId,
+    user_id: userId,
+    nonce,
+    ctime: Math.floor(Date.now() / 1000),
+    expire,
+    payload: "",
+  });
+
+  const key = Buffer.from(appSign, "hex"); // 32 bytes → AES-256
+  const iv = crypto.randomBytes(16);        // random IV
+  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+  const enc = Buffer.concat([cipher.update(Buffer.from(content, "utf8")), cipher.final()]);
+
+  const packed = Buffer.allocUnsafe(8 + 2 + iv.length + 2 + enc.length);
+  let offset = 0;
+  packed.writeBigInt64BE(BigInt(expire), offset); offset += 8;
+  packed.writeUInt16BE(iv.length, offset); offset += 2;
+  iv.copy(packed, offset); offset += iv.length;
+  packed.writeUInt16BE(enc.length, offset); offset += 2;
+  enc.copy(packed, offset);
+
+  return "04" + packed.toString("base64");
+}
+
+liveRouter.get("/zego-token", (req: Request, res: Response) => {
+  const userId = String(req.query.userId ?? `viewer_${crypto.randomBytes(4).toString("hex")}`);
+  const token = generateZegoToken(ZEGO_APP_ID, userId, ZEGO_APP_SIGN, 3600);
+  res.json({ token, userId, expire: Math.floor(Date.now() / 1000) + 3600, appId: ZEGO_APP_ID });
+});
+
+function normalizePhone(phone: string, countryCode = "62"): string {
+  const stripped = countryCode.replace(/^\+/, "");
+  let p = phone.trim().replace(/\s+/g, "").replace(/[^0-9]/g, "");
+  if (p.startsWith("0")) p = stripped + p.slice(1);
+  if (!p.startsWith(stripped)) p = stripped + p;
+  return p;
+}
+
+liveRouter.post("/send-otp", async (req: Request, res: Response) => {
+  const { phone, phoneRegion = "ID", phoneRegionCode = "+62" } = req.body as {
+    phone?: string;
+    phoneRegion?: string;
+    phoneRegionCode?: string;
+  };
+
+  if (!phone) { res.status(400).json({ success: false, error: "Phone required" }); return; }
+
+  const normalizedPhone = normalizePhone(phone, phoneRegionCode);
+  // Also try with raw input format (some APIs want local format with leading 0)
+  const rawPhone = phone.trim().replace(/\s+/g, "").replace(/[^0-9]/g, "");
+  const localPhone = rawPhone.startsWith("0") ? rawPhone : `0${rawPhone}`;
+
+  // sendOtp from Api.smali: /plr/grcen/verify-code/v1/centralized/phone
+  const url = `${HOT51_BASE}/${MERCHANT_ID}/api${API.sendOtp}`;
+
+  // Exhaustive parameter variants — include merchantId in body, try all phone formats
+  const attempts = [
+    { phone: normalizedPhone, phoneRegion: "62", loginType: 1, merchantId: MERCHANT_ID },
+    { phone: normalizedPhone, areaCode: "62", loginType: 1, merchantId: MERCHANT_ID },
+    { phone: localPhone, phoneRegion: "62", loginType: 1, merchantId: MERCHANT_ID },
+    { mobile: localPhone, areaCode: "62", loginType: 1, merchantId: MERCHANT_ID },
+    { mobile: normalizedPhone, areaCode: "62", loginType: 1, merchantId: MERCHANT_ID },
+    { phone: normalizedPhone, countryCode: "62", loginType: 1 },
+    { phone: localPhone, countryCode: "62", loginType: 1 },
+    { mobile: normalizedPhone, countryCode: "62", loginType: 1 },
+    { phone: normalizedPhone, loginType: 1 },
+    { mobile: normalizedPhone, loginType: 1 },
+    { phone: localPhone, loginType: 1 },
+    { phoneNum: normalizedPhone, phoneRegion: "62", loginType: 1 },
+    { phoneNum: normalizedPhone, areaCode: "62", loginType: 1 },
+  ];
+
+  let lastData: Record<string, unknown> = {};
+  for (const bodyObj of attempts) {
+    try {
+      const data = await hotFetch(url, {
+        method: "POST",
+        headers: OTP_HEADERS,
+        body: JSON.stringify(bodyObj),
+        timeoutMs: 15_000,
+      }) as Record<string, unknown>;
+
+      req.log.info({ bodyObj, response: data }, "send-otp attempt");
+
+      const isOk = isApiOk(data);
+      if (isOk) {
+        res.json({ success: true, message: "Kode OTP dikirim. Cek SMS Anda.", phone: normalizedPhone });
+        return;
+      }
+      lastData = data;
+    } catch (err: unknown) {
+      lastData = { networkError: err instanceof Error ? err.message : "fetch failed" };
+    }
+  }
+
+  const inner = (lastData.data ?? lastData) as Record<string, unknown>;
+  const rootCode = Number(lastData.code ?? inner.code ?? 0);
+  const errCode = String(inner.errorCode ?? lastData.errorCode ?? "");
+  const errMsg = String((inner.localizedValue ?? lastData.localizedValue ?? errCode) || JSON.stringify(lastData));
+  const hint = (rootCode === 500)
+    ? "Server gagal kirim SMS. Pastikan nomor HP benar dan aktif."
+    : errCode === "P8036"
+      ? "Parameter error — coba lagi atau hubungi support."
+      : errMsg;
+  res.json({ success: false, error: hint, errorCode: errCode, raw: lastData, phone: normalizedPhone });
+});
+
+liveRouter.post("/verify-otp", async (req: Request, res: Response) => {
+  const { phone, verifyCode, phoneRegion = "ID", phoneRegionCode = "+62" } = req.body as {
+    phone?: string;
+    verifyCode?: string;
+    phoneRegion?: string;
+    phoneRegionCode?: string;
+  };
+
+  if (!phone || !verifyCode) {
+    res.status(400).json({ success: false, error: "Phone dan kode OTP wajib diisi" });
+    return;
+  }
+
+  const normalizedPhone = normalizePhone(phone, phoneRegionCode);
+  // verifyOtp from Api.smali: /plr/grcen/verify-code/verify/phone
+  const url = `${HOT51_BASE}/${MERCHANT_ID}/api${API.verifyOtp}`;
+
+  // Exhaustive parameter variants — mirrors send-otp attempts with verifyCode/code
+  const attempts = [
+    { phone: normalizedPhone, phoneRegion: "62", verifyCode, loginType: 1 },
+    { phone: normalizedPhone, areaCode: "62", verifyCode, loginType: 1 },
+    { phone: normalizedPhone, countryCode: "62", verifyCode, loginType: 1 },
+    { mobile: normalizedPhone, areaCode: "62", verifyCode, loginType: 1 },
+    { mobile: normalizedPhone, countryCode: "62", verifyCode, loginType: 1 },
+    { mobile: normalizedPhone, phoneRegion: "62", verifyCode, loginType: 1 },
+    { phone: normalizedPhone, code: verifyCode, areaCode: "62", loginType: 1 },
+    { mobile: normalizedPhone, code: verifyCode, areaCode: "62", loginType: 1 },
+    { phone: normalizedPhone, verifyCode, loginType: 1 },
+    { mobile: normalizedPhone, verifyCode, loginType: 1 },
+    { phoneNum: normalizedPhone, phoneRegion: "62", verifyCode, loginType: 1 },
+    { phoneNum: normalizedPhone, areaCode: "62", verifyCode, loginType: 1 },
+  ];
+
+  let lastData: Record<string, unknown> = {};
+  for (const bodyObj of attempts) {
+    try {
+      const data = await hotFetch(url, {
+        method: "POST",
+        headers: OTP_HEADERS,
+        body: JSON.stringify(bodyObj),
+        timeoutMs: 15_000,
+      }) as Record<string, unknown>;
+
+      req.log.info({ bodyObj, data }, "verify-otp attempt");
+
+      const isOk = isApiOk(data);
+      if (!isOk) { lastData = data; continue; }
+
+      let ac = "", sign = "", username = "";
+
+      const AC_KEYS = ["ac", "userId", "id", "memberId", "playerId", "uid"];
+      const SIGN_KEYS = ["sign", "token", "sessionToken", "accessToken", "authorization", "authToken"];
+      const NAME_KEYS = ["username", "nickname", "nickName", "name", "account"];
+
+      const scanForSession = (obj: unknown): void => {
+        if (!obj || typeof obj !== "object") return;
+        for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+          if (!ac && AC_KEYS.includes(k) && v && typeof v !== "object") ac = String(v);
+          if (!sign && SIGN_KEYS.includes(k) && v && typeof v !== "object" && String(v).length > 8) sign = String(v);
+          if (!username && NAME_KEYS.includes(k) && v && typeof v !== "object") username = String(v);
+          if (v && typeof v === "object") scanForSession(v);
+        }
+      };
+      scanForSession(data);
+
+      if (!ac || !sign) {
+        res.json({
+          success: false,
+          error: "Respons API tidak mengandung sesi. Gunakan 'Set credentials manual' atau coba lagi.",
+          raw: data,
+        });
+        return;
+      }
+
+      session = { ac, sign, username: username || normalizedPhone, phone: normalizedPhone };
+      cache = null;
+      req.log.info({ ac, username: session.username }, "session saved");
+      res.json({ success: true, username: session.username, message: "Login berhasil!" });
+      return;
+    } catch (err: unknown) {
+      lastData = { networkError: err instanceof Error ? err.message : "fetch failed" };
+    }
+  }
+
+  const errMsg = String(lastData.localizedValue ?? lastData.errorCode ?? JSON.stringify(lastData));
+  res.json({ success: false, error: errMsg, raw: lastData });
+});
+
+liveRouter.post("/set-credentials", (req: Request, res: Response) => {
+  const { ac, sign, username = "" } = req.body as { ac?: string; sign?: string; username?: string };
+  if (!ac || !sign) {
+    res.status(400).json({ success: false, error: "ac and sign required" });
+    return;
+  }
+  session = { ac, sign, username };
+  cache = null;
+  res.json({ success: true, message: "Credentials set" });
+});
+
+liveRouter.get("/session-status", (_req: Request, res: Response) => {
+  res.json({ loggedIn: !!session, username: session?.username ?? null });
+});
+
+liveRouter.post("/logout", (_req: Request, res: Response) => {
+  session = null;
+  cache = null;
+  res.json({ success: true });
+});
+
+/** GET /api-info — returns all API endpoints extracted from APK for reference */
+liveRouter.get("/api-info", (_req: Request, res: Response) => {
+  const base = `${HOT51_BASE}/${MERCHANT_ID}/api`;
+  res.json({
+    source: "APK smali: com/example/obs/player/component/net/Api.smali",
+    base: HOT51_BASE,
+    merchantId: MERCHANT_ID,
+    endpoints: Object.fromEntries(
+      Object.entries(API).map(([k, v]) => [k, `${base}${v}`])
+    ),
+    cdnNodes: CDN_NODES.map(n => `https://${nodeToDomain(n)}/live/${MERCHANT_ID}_{roomId}_${STREAM_KEY}.flv`),
+    hasAuth: !!session,
+  });
+});
+
+/** POST /live-next — get next live room using APK scrolliv/live/next then swipe-switch
+ *  Confirmed body format from real APK traffic capture:
+ *    scrolliv/live/next: {"aid": anchorId, "isSupportH265": true}   ← "aid" not "anchorId"!
+ *    swipe-switch: {"anchorId": ..., "type": 0}
+ */
+liveRouter.post("/live-next", async (req: Request, res: Response) => {
+  const { anchorId, liveId, direction = 0 } = req.body as {
+    anchorId?: string;
+    liveId?: string;
+    direction?: number;
+  };
+
+  if (!anchorId) {
+    res.status(400).json({ success: false, error: "anchorId required" });
+    return;
+  }
+
+  // scrolliv/live/next uses "aid" field (NOT "anchorId") per real APK traffic
+  const liveNextBody = JSON.stringify({ aid: anchorId, isSupportH265: true });
+  // swipe-switch uses anchorId + type (direction)
+  const swipeBody = JSON.stringify({ anchorId, liveId: liveId ?? anchorId, type: direction });
+
+  const attempts = [
+    { url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.liveNext}`),    body: liveNextBody },
+    { url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.swipeSwitch}`), body: swipeBody },
+  ];
+
+  for (const ep of attempts) {
+    try {
+      const headers = getPostHeaders(ep.body);
+      const data = await hotFetch(ep.url, { method: "POST", headers, body: ep.body, timeoutMs: 10_000 }) as Record<string, unknown>;
+      if (isApiOk(data)) {
+        res.json({ success: true, data });
+        return;
+      }
+    } catch {
+      continue;
+    }
+  }
+  res.json({ success: false, error: "Tidak bisa menemukan live berikutnya" });
+});
+
+/** Wrap a CDN URL through the Cloudflare Worker if configured */
+function wrapWithCfWorker(cdnUrl: string): string {
+  if (!CF_WORKER_URL) return cdnUrl;
+  return `${CF_WORKER_URL}/?url=${encodeURIComponent(cdnUrl)}`;
+}
+
+liveRouter.get("/cf-worker-status", (_req: Request, res: Response) => {
+  res.json({
+    configured: !!CF_WORKER_URL,
+    workerUrl: CF_WORKER_URL || null,
+    hint: CF_WORKER_URL
+      ? "Cloudflare Worker aktif — CDN stream diarahkan lewat Cloudflare"
+      : "Belum dikonfigurasi — set HOT51_CF_WORKER_URL di Secrets",
+  });
+});
+
+/** GET /api/proxy-status — status pool proxy Indonesia */
+liveRouter.get("/proxy-status", (_req: Request, res: Response) => {
+  const live = getLiveProxies();
+  const pool = PROXY_URL
+    ? [PROXY_URL, ...dynamicProxyPool.filter(p => p !== PROXY_URL)]
+    : dynamicProxyPool;
+  const dead = pool.filter(p => deadProxies.has(p));
+  res.json({
+    configured: PROXY_URL || null,
+    poolSize: pool.length,
+    liveCount: live.length,
+    deadCount: dead.length,
+    liveProxies: live.slice(0, 10),
+    deadProxies: dead.slice(0, 10),
+    lastRefresh: proxyPoolLastRefresh ? new Date(proxyPoolLastRefresh).toISOString() : null,
+    hint: live.length > 0
+      ? `Menggunakan proxy aktif: ${live[0]}`
+      : "Semua proxy mati — reset dan coba ulang",
+  });
+});
+
+/**
+ * CDN-domain → working proxy cache.
+ * When a proxy successfully serves a CDN URL, we remember it for that domain
+ * and try it first on the next request (CDN proxies tend to stay consistent).
+ * Entries expire after 10 minutes.
+ */
+const cdnProxyCache = new Map<string, { proxy: string; ts: number }>();
+const CDN_PROXY_CACHE_TTL = 10 * 60_000;
+
+function getCachedCdnProxy(hostname: string): string | null {
+  const entry = cdnProxyCache.get(hostname);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CDN_PROXY_CACHE_TTL) { cdnProxyCache.delete(hostname); return null; }
+  return entry.proxy;
+}
+
+function setCachedCdnProxy(hostname: string, proxyUrl: string): void {
+  cdnProxyCache.set(hostname, { proxy: proxyUrl, ts: Date.now() });
+}
+
+/**
+ * Build CDN fallback URLs for Hot51 bcdn5.livcdn.com streams.
+ * Substitutes the CDN subdomain (bcdn5 → bcdn1..4, pull.cdnsi) while keeping
+ * the path and auth query string intact. Tencent LVB clusters share auth keys.
+ */
+function buildCdnFallbackUrls(primaryUrl: string): string[] {
+  try {
+    const u = new URL(primaryUrl);
+    if (!u.hostname.includes("livcdn.com") && !u.hostname.includes("cdnsi.com")) return [];
+    const path = u.pathname + u.search;
+    const fallbacks: string[] = [];
+    // Try all bcdn nodes
+    for (const node of ["bcdn1", "bcdn2", "bcdn3", "bcdn4", "bcdn5"]) {
+      const host = `${node}.livcdn.com`;
+      if (host !== u.hostname) fallbacks.push(`https://${host}${path}`);
+    }
+    // Also try pull.cdnsi.com with same path (CDN mirror)
+    fallbacks.push(`https://pull.cdnsi.com${path}`);
+    return fallbacks;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Attempt to fetch a URL through the proxy rotation pool using PARALLEL racing.
+ * Tries the cached working proxy first, then batches of pool proxies.
+ * Network errors mark a proxy dead; HTTP errors (4xx/5xx) do NOT mark dead.
+ * Returns the response + winning proxy, or null if nothing worked.
+ */
+async function fetchViaBestProxy(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs = 10_000,
+): Promise<{ res: Awaited<ReturnType<typeof undiciFetch>>; proxy: string | null } | null> {
+  const PER_ATTEMPT = Math.min(7_000, Math.floor(timeoutMs * 0.65));
+  const BATCH_SIZE = 6;
+
+  const tryProxy = async (proxyUrl: string): Promise<{ res: Awaited<ReturnType<typeof undiciFetch>>; proxy: string }> => {
+    const dispatcher = getProxyAgent(proxyUrl);
+    let r: Awaited<ReturnType<typeof undiciFetch>>;
+    try {
+      r = await undiciFetch(url, { headers, dispatcher, signal: AbortSignal.timeout(PER_ATTEMPT) });
+    } catch (e) {
+      markDead(proxyUrl);
+      throw e;
+    }
+    if (!r.ok) {
+      throw Object.assign(new Error(`HTTP ${r.status}`), { cdnStatus: r.status });
+    }
+    return { res: r, proxy: proxyUrl };
+  };
+
+  // STEP 0: Try cached working proxy first (fastest path for subsequent requests)
+  try {
+    const hostname = new URL(url).hostname;
+    const cached = getCachedCdnProxy(hostname);
+    if (cached && !deadProxies.has(cached)) {
+      try {
+        const result = await tryProxy(cached);
+        return result; // cache hit → immediate success
+      } catch {
+        // cached proxy failed → remove from cache, fall through
+        cdnProxyCache.delete(hostname);
+      }
+    }
+  } catch { /* URL parse error */ }
+
+  const liveProxies = getLiveProxies();
+
+  // STEP 1: Race proxies in parallel batches — first 2xx response wins
+  for (let i = 0; i < Math.min(liveProxies.length, 30); i += BATCH_SIZE) {
+    const batch = liveProxies.slice(i, i + BATCH_SIZE);
+    const result = await Promise.any(batch.map(tryProxy)).catch(() => null);
+
+    if (result) {
+      // Cache the winning proxy for this CDN domain
+      try {
+        const hostname = new URL(url).hostname;
+        if (hostname.includes("livcdn.com") || hostname.includes("cdnsi.com") || hostname.includes("baccdn.com")) {
+          setCachedCdnProxy(hostname, result.proxy);
+        }
+      } catch { /* ignore */ }
+      return result;
+    }
+  }
+
+  // STEP 2: Last resort — direct connection (useful for non-geo-blocked endpoints)
+  try {
+    const r = await undiciFetch(url, { headers, signal: AbortSignal.timeout(Math.min(timeoutMs, 5_000)) });
+    if (r.ok) return { res: r, proxy: null };
+  } catch { /* ignore */ }
+
+  return null;
+}
+
+liveRouter.get("/stream-proxy", async (req: Request, res: Response) => {
+  const roomId   = String(req.query.roomId  ?? "");
+  const anchorId = String(req.query.anchorId ?? "");
+  const liveId   = String(req.query.liveId  ?? "");
+  if (!roomId) { res.status(400).json({ error: "Missing ?roomId" }); return; }
+
+  let candidateUrls: string[] = [];
+
+  const realUrl = await getRealStreamUrl(roomId, anchorId, liveId);
+  if (realUrl) candidateUrls.push(realUrl);
+
+  const rawCdnUrls = buildCDNUrls(roomId, anchorId);
+  if (CF_WORKER_URL) candidateUrls = candidateUrls.concat(rawCdnUrls.map(wrapWithCfWorker));
+  candidateUrls = candidateUrls.concat(rawCdnUrls);
+
+  const cdnHeaders = {
+    "User-Agent": "Lavf/61.1.100",
+    Accept: "*/*",
+    "Accept-Encoding": "identity",
+    Referer: "https://hot51.com",
+    Origin: "https://hot51.com",
+    "Icy-MetaData": "1",
+  };
+
+  req.log.info({ roomId, candidates: candidateUrls.length }, "stream-proxy start");
+
+  for (const streamUrl of candidateUrls) {
+    try {
+      const isCfUrl = CF_WORKER_URL ? streamUrl.includes(CF_WORKER_URL) : false;
+      let upstream: Awaited<ReturnType<typeof undiciFetch>> | null = null;
+      let usedProxy: string | null = null;
+
+      if (isCfUrl) {
+        const r = await undiciFetch(streamUrl, {
+          headers: { Accept: "*/*", "Accept-Encoding": "identity" },
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (r.ok) { upstream = r; usedProxy = "cloudflare"; }
+      } else {
+        const result = await fetchViaBestProxy(streamUrl, cdnHeaders, 12_000);
+        if (result) { upstream = result.res; usedProxy = result.proxy; }
+      }
+
+      if (!upstream || !upstream.body) continue;
+
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Content-Type", upstream.headers.get("content-type") ?? "video/x-flv");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Proxy-Mode", usedProxy ?? "direct");
+
+      const reader = upstream.body.getReader();
+      req.on("close", () => reader.cancel().catch(() => {}));
+      const pump = async (): Promise<void> => {
+        const { done, value } = await reader.read();
+        if (done) { res.end(); return; }
+        if (!res.writableEnded) res.write(value);
+        return pump();
+      };
+      await pump();
+      return;
+    } catch {
+      continue;
+    }
+  }
+
+  if (!res.headersSent) {
+    res.status(403).json({
+      error: "CDN Hot51 tidak dapat dijangkau — semua proxy gagal.",
+      hint: "Coba refresh halaman atau set HOT51_CF_WORKER_URL di Secrets untuk bypass geoblocking.",
+      hasAuth: !!session,
+    });
+  }
+});
+
+/** GET /api/hls-proxy?url=<encoded_m3u8_url>
+ * Fetches an HLS manifest through the proxy pool and rewrites segment URLs
+ * to go through /api/ts-proxy so the browser never touches the CDN directly.
+ */
+liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
+  const rawUrl = String(req.query.url ?? "");
+  if (!rawUrl || !rawUrl.startsWith("http")) {
+    res.status(400).json({ error: "Missing or invalid ?url" });
+    return;
+  }
+
+  const cdnHeaders = {
+    "User-Agent": "Lavf/61.1.100",
+    Accept: "*/*",
+    "Accept-Encoding": "identity",
+    Referer: "https://hot51.com",
+    Origin: "https://hot51.com",
+  };
+
+  req.log.info({ url: rawUrl }, "hls-proxy start");
+
+  // Build ordered list of URLs to try: primary first, then CDN domain fallbacks
+  const urlsToTry = [rawUrl, ...buildCdnFallbackUrls(rawUrl)];
+
+  try {
+    let result: { res: Awaited<ReturnType<typeof undiciFetch>>; proxy: string | null } | null = null;
+    let usedUrl = rawUrl;
+
+    for (const candidateUrl of urlsToTry) {
+      result = await fetchViaBestProxy(candidateUrl, cdnHeaders, 14_000);
+      if (result?.res.ok) { usedUrl = candidateUrl; break; }
+      // Non-ok but got response — log and try next CDN domain
+      if (result?.res) {
+        req.log.warn({ url: candidateUrl, status: result.res.status }, "hls-proxy: CDN rejected, trying fallback domain");
+        // Drain body to avoid leaks
+        result.res.body?.cancel().catch(() => {});
+        result = null;
+      }
+    }
+
+    if (!result || !result.res.body) {
+      req.log.warn({ url: rawUrl }, "hls-proxy: all proxies and CDN domains failed");
+      res.status(502).json({
+        error: "HLS manifest tidak bisa diambil — semua proxy gagal",
+        url: rawUrl,
+        hint: "CDN mungkin memblokir semua proxy. Coba set HOT51_CF_WORKER_URL.",
+      });
+      return;
+    }
+
+    const status = result.res.status;
+    req.log.info({ url: usedUrl, status, proxy: result.proxy }, "hls-proxy: got CDN response");
+
+    if (!result.res.ok) {
+      res.status(502).json({
+        error: `CDN menolak permintaan: HTTP ${status}`,
+        url: usedUrl,
+        proxy: result.proxy,
+        hint: status === 403
+          ? "Stream mungkin terkunci atau STREAM_KEY salah"
+          : status === 404
+            ? "Stream tidak ditemukan — anchor mungkin sudah offline"
+            : `CDN error ${status}`,
+      });
+      return;
+    }
+
+    const text = await result.res.text();
+    const baseUrl = rawUrl.substring(0, rawUrl.lastIndexOf("/") + 1);
+
+    // Rewrite each line: absolute URLs and relative paths pointing to TS segments or sub-manifests
+    const rewritten = text.split("\n").map(line => {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) return line;
+      // Resolve relative segment URLs to absolute, then wrap in ts-proxy
+      let absUrl: string;
+      if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+        absUrl = trimmed;
+      } else {
+        absUrl = baseUrl + trimmed;
+      }
+      // Sub-manifests (.m3u8) → route through hls-proxy, segments (.ts) → ts-proxy
+      if (absUrl.includes(".m3u8")) {
+        return `/api/hls-proxy?url=${encodeURIComponent(absUrl)}`;
+      }
+      return `/api/ts-proxy?url=${encodeURIComponent(absUrl)}`;
+    }).join("\n");
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Proxy-Mode", result.proxy ?? "direct");
+    res.send(rewritten);
+  } catch (err) {
+    req.log.error({ url: rawUrl, err }, "hls-proxy: exception");
+    res.status(502).json({ error: String(err) });
+  }
+});
+
+/** GET /api/ts-proxy?url=<encoded_segment_url>
+ * Proxies a single HLS TS segment through the proxy pool.
+ */
+liveRouter.get("/ts-proxy", async (req: Request, res: Response) => {
+  const rawUrl = String(req.query.url ?? "");
+  if (!rawUrl || !rawUrl.startsWith("http")) {
+    res.status(400).json({ error: "Missing or invalid ?url" });
+    return;
+  }
+
+  const cdnHeaders = {
+    "User-Agent": "Lavf/61.1.100",
+    Accept: "*/*",
+    "Accept-Encoding": "identity",
+    Referer: "https://hot51.com",
+    Origin: "https://hot51.com",
+    Range: String(req.headers["range"] ?? "bytes=0-"),
+  };
+
+  try {
+    const result = await fetchViaBestProxy(rawUrl, cdnHeaders, 15_000);
+    if (!result || !result.res.body) {
+      res.status(502).send("");
+      return;
+    }
+
+    if (!result.res.ok) {
+      res.status(result.res.status).send(`CDN returned ${result.res.status}`);
+      return;
+    }
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Content-Type", result.res.headers.get("content-type") ?? "video/MP2T");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Proxy-Mode", result.proxy ?? "direct");
+    const contentLength = result.res.headers.get("content-length");
+    if (contentLength) res.setHeader("Content-Length", contentLength);
+
+    const reader = result.res.body.getReader();
+    req.on("close", () => reader.cancel().catch(() => {}));
+    const pump = async (): Promise<void> => {
+      const { done, value } = await reader.read();
+      if (done) { res.end(); return; }
+      if (!res.writableEnded) res.write(value);
+      return pump();
+    };
+    await pump();
+  } catch (err) {
+    if (!res.headersSent) res.status(502).send(String(err));
+  }
+});
+
+/**
+ * GET /api/cdn-test?roomId=<id>
+ * Diagnostic: test the proxy pool against the actual CDN stream URL for a room.
+ * Returns which proxy worked (or why they all failed) so we can debug geo-blocking.
+ */
+liveRouter.get("/cdn-test", async (req: Request, res: Response) => {
+  const roomId = String(req.query.roomId ?? "");
+  if (!roomId) { res.status(400).json({ error: "Missing ?roomId" }); return; }
+
+  const testUrls = [
+    `https://pull.cdnsi.com/live/${MERCHANT_ID}_${roomId}_${STREAM_KEY}.m3u8`,
+    `https://pull.cdnsi.com/live/${MERCHANT_ID}_${roomId}_${STREAM_KEY}.flv`,
+    `https://hx.baccdn.com/live/${MERCHANT_ID}_${roomId}_${STREAM_KEY}.m3u8`,
+  ];
+
+  const cdnHeaders = {
+    "User-Agent": "Lavf/61.1.100",
+    Accept: "*/*",
+    "Accept-Encoding": "identity",
+    Referer: "https://hot51.com",
+    Origin: "https://hot51.com",
+  };
+
+  const results: Array<{ url: string; status: number | string; proxy: string | null; ok: boolean }> = [];
+
+  for (const url of testUrls) {
+    try {
+      const r = await fetchViaBestProxy(url, cdnHeaders, 10_000);
+      if (r) {
+        // consume body to avoid leak
+        await r.res.body?.cancel().catch(() => {});
+        results.push({ url, status: r.res.status, proxy: r.proxy, ok: r.res.ok });
+      } else {
+        results.push({ url, status: "no_response", proxy: null, ok: false });
+      }
+    } catch (e) {
+      results.push({ url, status: String(e), proxy: null, ok: false });
+    }
+  }
+
+  const proxyPool = getLiveProxies();
+  res.json({
+    roomId,
+    streamKey: STREAM_KEY,
+    results,
+    proxyPoolSize: proxyPool.length,
+    topProxies: proxyPool.slice(0, 5),
+    hint: results.some(r => r.ok)
+      ? "CDN terjangkau! Stream harus bisa diputar."
+      : results.some(r => r.status === 403)
+        ? "CDN menolak (403) — STREAM_KEY mungkin salah atau stream dikunci"
+        : results.some(r => r.status === 404)
+          ? "CDN 404 — anchor mungkin offline"
+          : "Semua proxy gagal menjangkau CDN — coba proxy lain atau CF Worker",
+  });
+});
+
+/** GET /api/gifts — daftar gift dari HOT51 */
+liveRouter.get("/gifts", async (_req: Request, res: Response) => {
+  const endpoints = [
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList}`,
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList2}`,
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.getPackageGiftList}`,
+  ];
+  for (const url of endpoints) {
+    try {
+      const data = await hotFetch(url, { method: "POST", headers: getUserHeaders(), body: JSON.stringify({}), timeoutMs: 8_000 });
+      if (data && typeof data === "object") {
+        const d = data as Record<string, unknown>;
+        if (d.data || d.records || d.list) {
+          res.json({ success: true, data });
+          return;
+        }
+      }
+    } catch { continue; }
+  }
+  res.json({ success: false, error: "Tidak bisa memuat daftar gift", data: null });
+});
+
+/** POST /api/send-gift — kirim gift ke anchor { anchorId, liveId, giftId, giftNum } */
+liveRouter.post("/send-gift", async (req: Request, res: Response) => {
+  if (!session) {
+    res.status(401).json({ success: false, error: "Perlu login dulu — set HOT51_AC + HOT51_SIGN di Secrets" });
+    return;
+  }
+  const { anchorId, liveId, giftId, giftNum = 1 } = req.body ?? {};
+  if (!anchorId || !liveId || !giftId) {
+    res.status(400).json({ success: false, error: "Perlu anchorId, liveId, dan giftId" });
+    return;
+  }
+  const endpoints = [
+    { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.sendGift}`, body: JSON.stringify({ anchorId, liveId, giftId, giftNum }) },
+    { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.sendPackageGift}`, body: JSON.stringify({ anchorId, liveId, giftId, giftNum }) },
+  ];
+  for (const ep of endpoints) {
+    try {
+      const data = await hotFetch(ep.url, { method: "POST", headers: getUserHeaders(), body: ep.body, timeoutMs: 8_000 });
+      if (data && typeof data === "object") {
+        res.json({ success: true, data });
+        return;
+      }
+    } catch { continue; }
+  }
+  res.json({ success: false, error: "Gagal mengirim gift" });
+});
+
+/** GET /api/server-config — konfigurasi merchant dari HOT51 */
+liveRouter.get("/server-config", async (_req: Request, res: Response) => {
+  try {
+    const data = await hotFetch(
+      `${HOT51_BASE}/${MERCHANT_ID}/api${API.serverStatus}`,
+      { method: "POST", headers: getUserHeaders(), body: JSON.stringify({}), timeoutMs: 8_000 }
+    );
+    res.json({ success: true, data });
+  } catch (err) {
+    res.json({ success: false, error: String(err) });
+  }
+});
+
+export default liveRouter;

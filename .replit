@@ -1,0 +1,59 @@
+modules = ["nodejs-24"]
+
+[deployment]
+router = "application"
+deploymentTarget = "autoscale"
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+runButton = "Project"
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
+
+[[ports]]
+localPort = 5000
+externalPort = 5000
+
+[[ports]]
+localPort = 8080
+externalPort = 80
+
+[[ports]]
+localPort = 8081
+externalPort = 8081
+
+[[ports]]
+localPort = 8082
+externalPort = 3003
+
+[[ports]]
+localPort = 20677
+externalPort = 3000
+
+[[ports]]
+localPort = 25104
+externalPort = 3001
+
+[[ports]]
+localPort = 25105
+externalPort = 4200
+
+[userenv]
+
+[userenv.shared]
+AGORA_APP_CERTIFICATE = "6dfd8bd4e2364fa4a57c01ec9757178e"
+AGORA_CUSTOMER_ID = "e5963aaa320545b4a9ce873f3fbe9627"
+HOT51_STREAM_KEY = "4ad75f5e2eb06d315ea14e8484a29e1d"
+HOT51_CF_WORKER_URL = "https://hot51-proxy.feryputrafer.workers.dev"
+
+[nix]
+channel = "stable-25_05"
