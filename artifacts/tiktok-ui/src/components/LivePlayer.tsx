@@ -12,6 +12,7 @@ interface LivePlayerProps {
   cover?: string;
   className?: string;
   zegoStreamId?: string;
+  onVideoElement?: (el: HTMLVideoElement | null) => void;
 }
 
 type PlayerState = "idle" | "loading" | "playing" | "error" | "blocked";
@@ -33,12 +34,16 @@ export default function LivePlayer({
   cover,
   className = "",
   zegoStreamId = "",
+  onVideoElement,
 }: LivePlayerProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [visible, setVisible] = useState(false);
 
   const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
-  const videoCallbackRef = useCallback((el: HTMLVideoElement | null) => setVideoEl(el), []);
+  const videoCallbackRef = useCallback((el: HTMLVideoElement | null) => {
+    setVideoEl(el);
+    onVideoElement?.(el);
+  }, [onVideoElement]);
 
   const hlsRef = useRef<Hls | null>(null);
   const playerRef = useRef<mpegts.Player | null>(null);

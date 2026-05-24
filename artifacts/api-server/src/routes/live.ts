@@ -3,6 +3,8 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import { fetch as undiciFetch, ProxyAgent } from "undici";
 import crypto from "crypto";
+import { createConnection as netCreate } from "net";
+import { connect as tlsConn } from "tls";
 
 const execFileAsync = promisify(execFile);
 
@@ -1784,6 +1786,256 @@ liveRouter.get("/server-config", async (_req: Request, res: Response) => {
   } catch (err) {
     res.json({ success: false, error: String(err) });
   }
+});
+
+// ── Hot51 WebSocket per-room connection pool (shared across SSE clients) ────
+type RoomSSEClient = (event: string, data: unknown) => void;
+const roomWsClients = new Map<string, Set<RoomSSEClient>>();
+const roomWsActive  = new Map<string, boolean>();
+
+function broadcastRoom(anchorId: string, event: string, data: unknown) {
+  const clients = roomWsClients.get(anchorId);
+  if (!clients) return;
+  for (const fn of clients) { try { fn(event, data); } catch {} }
+}
+
+function startRoomWs(anchorId: string, wsUrl: string) {
+  if (roomWsActive.get(anchorId)) return;
+  roomWsActive.set(anchorId, true);
+
+  let buf = Buffer.alloc(0);
+  let reconnectDelay = 4_000;
+  let stopped = false;
+
+  function connect() {
+    if (stopped) return;
+    const clients = roomWsClients.get(anchorId);
+    if (!clients || clients.size === 0) { roomWsActive.delete(anchorId); return; }
+
+    let host: string, path: string, port: number, useTls: boolean;
+    try {
+      const u = new URL(wsUrl);
+      host   = u.hostname;
+      path   = u.pathname + (u.search ?? "");
+      useTls = u.protocol === "wss:";
+      port   = u.port ? parseInt(u.port) : (useTls ? 443 : 80);
+    } catch { roomWsActive.delete(anchorId); return; }
+
+    const keyB = Buffer.from(Array.from({ length: 16 }, () => Math.floor(Math.random() * 256)));
+    const key  = keyB.toString("base64");
+
+    function handleSocket(sock: import("net").Socket | import("tls").TLSSocket) {
+      sock.write([
+        `GET ${path} HTTP/1.1`, `Host: ${host}`, "Upgrade: websocket", "Connection: Upgrade",
+        `Sec-WebSocket-Key: ${key}`, "Sec-WebSocket-Version: 13",
+        `User-Agent: Cronet/590 (Linux; U; Android 10; en; RMX2030)`,
+        `Origin: https://play.hot51.tv`, "", "",
+      ].join("\r\n"));
+
+      let hdDone = false;
+      sock.on("data", (chunk: Buffer) => {
+        buf = Buffer.concat([buf, chunk]);
+        if (!hdDone) {
+          const idx = buf.indexOf("\r\n\r\n");
+          if (idx < 0) return;
+          hdDone = buf.slice(0, idx).toString().includes("101");
+          buf = buf.slice(idx + 4);
+          if (hdDone) {
+            reconnectDelay = 4_000;
+            broadcastRoom(anchorId, "ws_connected", { anchorId });
+          } else { sock.destroy(); return; }
+        }
+
+        while (buf.length >= 2) {
+          const b0 = buf[0], b1 = buf[1];
+          const op = b0 & 0x0f;
+          const masked = (b1 & 0x80) !== 0;
+          let pLen = b1 & 0x7f;
+          let off = 2;
+          if (pLen === 126) { if (buf.length < 4) break; pLen = buf.readUInt16BE(2); off = 4; }
+          else if (pLen === 127) { if (buf.length < 10) break; pLen = Number(buf.readBigUInt64BE(2)); off = 10; }
+          const mLen = masked ? 4 : 0;
+          const total = off + mLen + pLen;
+          if (buf.length < total) break;
+          if (op === 8) { sock.destroy(); buf = Buffer.alloc(0); break; }
+          if (op === 9 && !sock.destroyed) sock.write(Buffer.from([0x8a, 0x00]));
+          if (op === 1 || op === 2) {
+            let payload = buf.slice(off + mLen, total);
+            if (masked) { const mask = buf.slice(off, off + 4); payload = Buffer.from(payload.map((b, i) => b ^ mask[i % 4])); }
+            const text = payload.toString("utf8");
+            try {
+              const msg = JSON.parse(text) as Record<string, unknown>;
+              // Map Hot51 WS message types to SSE events
+              const t = (msg.t ?? msg.type ?? msg.tp ?? "") as string;
+              const nn = (msg.nn ?? msg.nickname ?? msg.name ?? "") as string;
+              const ct = (msg.ct ?? msg.content ?? msg.msg ?? "") as string;
+
+              if (t === "1" || t === "chat") {
+                broadcastRoom(anchorId, "chat", { nickname: nn, content: ct });
+              } else if (t === "2" || t === "gift") {
+                broadcastRoom(anchorId, "gift", { nickname: nn, giftName: msg.gn ?? msg.giftName, giftNum: msg.gc ?? msg.giftNum ?? 1 });
+              } else if (t === "3" || t === "join") {
+                broadcastRoom(anchorId, "join", { nickname: nn });
+              } else if (t === "toy" || ct?.toString().includes("Lovense")) {
+                broadcastRoom(anchorId, "lovense", { nickname: nn, level: msg.lv ?? msg.level, duration: msg.bt ?? msg.baubleTime });
+              } else {
+                broadcastRoom(anchorId, "raw", { t, preview: text.slice(0, 80) });
+              }
+            } catch {
+              // Try AES decrypt
+              try {
+                const cipher = crypto.createDecipheriv(
+                  "aes-128-cbc",
+                  Buffer.from(HOT51_WS_KEY, "utf8"),
+                  Buffer.from(HOT51_WS_IV,  "utf8"),
+                );
+                cipher.setAutoPadding(true);
+                const plain = Buffer.concat([cipher.update(payload), cipher.final()]).toString("utf8");
+                const msg2 = JSON.parse(plain) as Record<string, unknown>;
+                const nn2 = (msg2.nn ?? msg2.nickname ?? "") as string;
+                const ct2 = (msg2.ct ?? msg2.content ?? "") as string;
+                broadcastRoom(anchorId, "chat", { nickname: nn2, content: ct2, decrypted: true });
+              } catch { /* ignore */ }
+            }
+          }
+          buf = buf.slice(total);
+        }
+      });
+
+      const ping = setInterval(() => { if (!sock.destroyed) sock.write(Buffer.from([0x89, 0x00])); else clearInterval(ping); }, 25_000);
+      sock.on("close", () => {
+        clearInterval(ping); buf = Buffer.alloc(0);
+        broadcastRoom(anchorId, "ws_disconnected", { anchorId });
+        if (!stopped && (roomWsClients.get(anchorId)?.size ?? 0) > 0) {
+          setTimeout(connect, reconnectDelay);
+          reconnectDelay = Math.min(reconnectDelay * 1.5, 30_000);
+        } else { roomWsActive.delete(anchorId); }
+      });
+      sock.on("error", () => { if (!stopped) setTimeout(connect, reconnectDelay); });
+    }
+
+    if (useTls) {
+      const raw = netCreate(port, host);
+      raw.on("connect", () => {
+        const tls = tlsConn({ socket: raw, servername: host, rejectUnauthorized: false });
+        tls.on("secureConnect", () => handleSocket(tls));
+        tls.on("error", () => setTimeout(connect, reconnectDelay));
+      });
+      raw.on("error", () => setTimeout(connect, reconnectDelay));
+    } else {
+      const sock = netCreate(port, host);
+      sock.on("connect", () => handleSocket(sock));
+      sock.on("error", () => setTimeout(connect, reconnectDelay));
+    }
+  }
+
+  connect();
+}
+
+/** GET /api/live-sse — Server-Sent Events untuk komentar dan gift real-time per room */
+liveRouter.get("/live-sse", async (req: Request, res: Response) => {
+  const anchorId = (req.query.anchorId as string) ?? "";
+  if (!anchorId) { res.status(400).json({ error: "anchorId required" }); return; }
+
+  res.setHeader("Content-Type",  "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection",    "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  const send: RoomSSEClient = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  send("connected", { anchorId, ts: Date.now() });
+
+  // Register this SSE client
+  if (!roomWsClients.has(anchorId)) roomWsClients.set(anchorId, new Set());
+  roomWsClients.get(anchorId)!.add(send);
+
+  // Try to get wsUrl and start WebSocket if not already running
+  if (!roomWsActive.get(anchorId)) {
+    try {
+      const info = await fetchRoomInfo(anchorId);
+      if (info?.wsUrl) {
+        send("ws_found", { wsUrl: info.wsUrl.slice(0, 30) + "…" });
+        startRoomWs(anchorId, info.wsUrl);
+      } else {
+        send("ws_missing", { note: "WebSocket URL tidak tersedia untuk room ini — demo mode aktif" });
+      }
+    } catch {
+      send("ws_error", { note: "Gagal mendapatkan info room" });
+    }
+  }
+
+  req.on("close", () => {
+    roomWsClients.get(anchorId)?.delete(send);
+    if ((roomWsClients.get(anchorId)?.size ?? 0) === 0) roomWsClients.delete(anchorId);
+  });
+});
+
+/** POST /api/toy-interact — kirim interaksi Lovense toy ke anchor */
+liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
+  const { anchorId, liveId, level, duration } = (req.body ?? {}) as {
+    anchorId?: string; liveId?: string; level?: number; duration?: number;
+  };
+  if (!anchorId || !liveId) {
+    res.status(400).json({ success: false, error: "anchorId dan liveId diperlukan" });
+    return;
+  }
+
+  const lvl = Math.max(1, Math.min(4, Number(level) || 1));
+  const bt  = Math.max(1, Math.min(10, Number(duration) || 3));
+
+  // Try Hot51 toy interaction API
+  const toyUrl = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/interact`);
+  const body   = JSON.stringify({ anchorId, liveId, level: lvl, baubleTime: bt });
+
+  try {
+    const data = await hotFetch(toyUrl, {
+      method: "POST",
+      headers: getPostHeaders(body),
+      body,
+      timeoutMs: 8_000,
+    });
+    const d = data as Record<string, unknown>;
+    // Broadcast lovense event to all SSE clients for this room
+    broadcastRoom(anchorId, "lovense", { nickname: "Penonton", level: ["", "Low", "Mid", "High", "Super"][lvl], duration: bt });
+    res.json({ success: true, data: d });
+  } catch (err) {
+    // Even if API fails, broadcast locally and return note
+    broadcastRoom(anchorId, "lovense", { nickname: "Penonton", level: ["", "Low", "Mid", "High", "Super"][lvl], duration: bt });
+    res.json({
+      success: false,
+      note: "Fitur toy memerlukan akun Hot51 yang terautentikasi",
+      error: String(err),
+    });
+  }
+});
+
+/** GET /api/recordings — daftar rekaman yang tersimpan */
+const recordings: Array<{ id: string; anchorId: string; username: string; ts: number; duration: number; size: number }> = [];
+
+liveRouter.get("/recordings", (_req: Request, res: Response) => {
+  res.json({ success: true, recordings });
+});
+
+/** POST /api/save-recording — simpan metadata rekaman dari frontend */
+liveRouter.post("/save-recording", (req: Request, res: Response) => {
+  const { anchorId, username, duration, size } = (req.body ?? {}) as {
+    anchorId?: string; username?: string; duration?: number; size?: number;
+  };
+  const entry = {
+    id: `rec_${Date.now()}`,
+    anchorId: anchorId ?? "",
+    username: username ?? "unknown",
+    ts: Date.now(),
+    duration: Number(duration) || 0,
+    size: Number(size) || 0,
+  };
+  recordings.push(entry);
+  if (recordings.length > 100) recordings.shift();
+  res.json({ success: true, recording: entry });
 });
 
 export default liveRouter;

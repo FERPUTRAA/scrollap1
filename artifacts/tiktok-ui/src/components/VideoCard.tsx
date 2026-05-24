@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
-import { Heart, MessageCircle, Share2, Music, Eye, Gift, Zap } from "lucide-react";
+import { Heart, MessageCircle, Share2, Music, Eye, Gift, Zap, Circle } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import LivePlayer from "./LivePlayer";
 import Hot51GiftPanel, { GiftItem } from "./Hot51GiftPanel";
@@ -7,6 +7,7 @@ import Hot51PKBar from "./Hot51PKBar";
 import Hot51LiveChat from "./Hot51LiveChat";
 import Hot51FlyingGifts from "./Hot51FlyingGifts";
 import Hot51LuckySpin from "./Hot51LuckySpin";
+import Hot51VibratorPanel from "./Hot51VibratorPanel";
 
 interface Video {
   id: string;
@@ -52,15 +53,23 @@ export default function VideoCard({ video }: VideoCardProps) {
   const [showHeart, setShowHeart] = useState(false);
 
   // HOT51 States
-  const [giftOpen, setGiftOpen]       = useState(false);
-  const [spinOpen, setSpinOpen]       = useState(false);
-  const [pkActive, setPkActive]       = useState(false);
-  const [pkPlayers, setPkPlayers]     = useState(makePKPlayers(video));
-  const [pkTimeLeft, setPkTimeLeft]   = useState(180);
-  const [coins, setCoins]             = useState(1500);
-  const [notice, setNotice]           = useState<string | null>(null);
-  const [noticeIdx, setNoticeIdx]     = useState(0);
-  const [shareCount, setShareCount]   = useState(video.shares);
+  const [giftOpen, setGiftOpen]         = useState(false);
+  const [spinOpen, setSpinOpen]         = useState(false);
+  const [vibratorOpen, setVibratorOpen] = useState(false);
+  const [pkActive, setPkActive]         = useState(false);
+  const [pkPlayers, setPkPlayers]       = useState(makePKPlayers(video));
+  const [pkTimeLeft, setPkTimeLeft]     = useState(180);
+  const [coins, setCoins]               = useState(1500);
+  const [notice, setNotice]             = useState<string | null>(null);
+  const [noticeIdx, setNoticeIdx]       = useState(0);
+  const [shareCount, setShareCount]     = useState(video.shares);
+  const [extraMsg, setExtraMsg]         = useState<import("./Hot51LiveChat").ChatMsg | null>(null);
+
+  // Recording
+  const [isRecording, setIsRecording] = useState(false);
+  const recorderRef  = useRef<MediaRecorder | null>(null);
+  const chunksRef    = useRef<Blob[]>([]);
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
 
   const flyLaunchRef = useRef<((gift: GiftItem, fromName?: string) => void) | null>(null);
   const pkTimerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -136,6 +145,56 @@ export default function VideoCard({ video }: VideoCardProps) {
     flyLaunchRef.current = fn;
   }, []);
 
+  const handleVibratorChat = useCallback((text: string) => {
+    setExtraMsg({ id: Date.now(), user: "Saya", text, color: "#EE1D52", type: "lovense", emoji: "〰️" });
+    setTimeout(() => setExtraMsg(null), 100);
+  }, []);
+
+  // ── Recording ───────────────────────────────────────────────────────
+  const startRecording = useCallback(() => {
+    if (!videoEl) return;
+    try {
+      const stream = (videoEl as HTMLVideoElement & { captureStream?: () => MediaStream }).captureStream?.();
+      if (!stream) { alert("Browser ini tidak mendukung perekaman stream"); return; }
+      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
+        ? "video/webm;codecs=vp9"
+        : MediaRecorder.isTypeSupported("video/webm")
+          ? "video/webm"
+          : "";
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+      chunksRef.current = [];
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: "video/webm" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `hot51-live-${video.username}-${Date.now()}.webm`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      };
+      recorder.start(1000);
+      recorderRef.current = recorder;
+      setIsRecording(true);
+    } catch (err) {
+      console.error("Recording error:", err);
+    }
+  }, [videoEl, video.username]);
+
+  const stopRecording = useCallback(() => {
+    recorderRef.current?.stop();
+    recorderRef.current = null;
+    setIsRecording(false);
+  }, []);
+
+  const toggleRecording = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (isRecording) stopRecording();
+    else startRecording();
+  }, [isRecording, startRecording, stopRecording]);
+
   return (
     <div
       className="relative w-full h-full select-none overflow-hidden"
@@ -158,6 +217,7 @@ export default function VideoCard({ video }: VideoCardProps) {
           hlsUrl={video.hlsUrl}
           cover={video.coverUrl}
           className="absolute inset-0"
+          onVideoElement={setVideoEl}
         />
       ) : video.coverUrl ? (
         <img
@@ -217,6 +277,14 @@ export default function VideoCard({ video }: VideoCardProps) {
             <span className="flex items-center gap-1 px-2 py-0.5 rounded-full bg-black/50 text-white text-[10px] font-semibold backdrop-blur-sm">
               <Eye size={10} />
               {video.likes}
+            </span>
+          )}
+          {/* Recording indicator */}
+          {isRecording && (
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-white text-[10px] font-bold"
+              style={{ background: "rgba(238,29,82,0.85)" }}>
+              <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+              REC
             </span>
           )}
         </div>
@@ -323,6 +391,25 @@ export default function VideoCard({ video }: VideoCardProps) {
           <span className="text-white text-[10px] font-semibold drop-shadow">Gift</span>
         </motion.button>
 
+        {/* HOT51: Lovense Vibrator button */}
+        <motion.button
+          whileTap={{ scale: 1.15 }}
+          onClick={(e) => { e.stopPropagation(); setVibratorOpen(true); }}
+          className="flex flex-col items-center gap-1"
+        >
+          <div
+            className="w-8 h-8 rounded-full flex items-center justify-center"
+            style={{
+              background: vibratorOpen
+                ? "linear-gradient(135deg,#EE1D52,#FF8C00)"
+                : "linear-gradient(135deg,#B44FED,#EE1D52)",
+            }}
+          >
+            <span className="text-sm">〰️</span>
+          </div>
+          <span className="text-white text-[10px] font-semibold drop-shadow">Toy</span>
+        </motion.button>
+
         {/* HOT51: PK Battle button */}
         <motion.button
           whileTap={{ scale: 1.15 }}
@@ -340,6 +427,36 @@ export default function VideoCard({ video }: VideoCardProps) {
             <Zap size={16} color="white" />
           </div>
           <span className="text-white text-[10px] font-semibold drop-shadow">{pkActive ? "PK Live" : "PK"}</span>
+        </motion.button>
+
+        {/* HOT51: Record button */}
+        <motion.button
+          whileTap={{ scale: 1.15 }}
+          onClick={toggleRecording}
+          className="flex flex-col items-center gap-1"
+        >
+          <div
+            className="w-8 h-8 rounded-full flex items-center justify-center relative"
+            style={{
+              background: isRecording
+                ? "rgba(238,29,82,0.9)"
+                : "rgba(0,0,0,0.55)",
+              border: "2px solid rgba(255,255,255,0.3)",
+            }}
+          >
+            {isRecording ? (
+              <motion.span
+                animate={{ scale: [1, 1.2, 1] }}
+                transition={{ repeat: Infinity, duration: 1 }}
+                className="w-3 h-3 rounded-sm bg-white"
+              />
+            ) : (
+              <Circle size={14} color="white" fill="rgba(238,29,82,0.7)" />
+            )}
+          </div>
+          <span className="text-white text-[10px] font-semibold drop-shadow">
+            {isRecording ? "Stop" : "Rekam"}
+          </span>
         </motion.button>
 
         {/* Spinning music disc */}
@@ -362,10 +479,12 @@ export default function VideoCard({ video }: VideoCardProps) {
         </div>
       </div>
 
-      {/* ── HOT51: Live Chat (GiftListFragment style floating comments) ── */}
+      {/* ── HOT51: Live Chat (real-time SSE + demo) ── */}
       <Hot51LiveChat
         streamerName={video.username}
         active={video.isLive ?? false}
+        anchorId={video.anchorId ?? video.id}
+        extraMsg={extraMsg}
       />
 
       {/* ── HOT51: Gift Panel ── */}
@@ -383,6 +502,16 @@ export default function VideoCard({ video }: VideoCardProps) {
         onClose={() => setSpinOpen(false)}
         coins={coins}
         onSpend={handleSpinSpend}
+      />
+
+      {/* ── HOT51: Lovense Vibrator Panel ── */}
+      <Hot51VibratorPanel
+        open={vibratorOpen}
+        onClose={() => setVibratorOpen(false)}
+        anchorId={video.anchorId ?? video.id}
+        liveId={video.liveId ?? video.id}
+        streamerName={video.username}
+        onChatMsg={handleVibratorChat}
       />
     </div>
   );
