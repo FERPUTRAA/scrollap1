@@ -565,7 +565,7 @@ export default function LivePlayer({
       )}
 
       {state === "playing" && (
-        <div className="absolute top-[72px] right-3 z-20 flex flex-col gap-1.5 items-center">
+        <div className="absolute top-[65px] right-3 z-20 flex flex-col gap-1.5 items-center">
           <button
             onClick={() => setMuted((m) => !m)}
             className="w-8 h-8 rounded-full flex items-center justify-center"

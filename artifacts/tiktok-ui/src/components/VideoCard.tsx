@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
-import { Heart, MessageCircle, Share2, Music, Eye, Gift, Zap, Circle } from "lucide-react";
+import { Heart, MessageCircle, Share2, Music, Eye, Gift, Zap, Circle, Download, Database } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import LivePlayer from "./LivePlayer";
 import Hot51GiftPanel, { GiftItem } from "./Hot51GiftPanel";
@@ -8,6 +8,8 @@ import Hot51LiveChat from "./Hot51LiveChat";
 import Hot51FlyingGifts from "./Hot51FlyingGifts";
 import Hot51LuckySpin from "./Hot51LuckySpin";
 import Hot51VibratorPanel from "./Hot51VibratorPanel";
+
+const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 
 interface Video {
   id: string;
@@ -52,7 +54,6 @@ export default function VideoCard({ video }: VideoCardProps) {
   const [followed, setFollowed] = useState(false);
   const [showHeart, setShowHeart] = useState(false);
 
-  // HOT51 States
   const [giftOpen, setGiftOpen]         = useState(false);
   const [spinOpen, setSpinOpen]         = useState(false);
   const [vibratorOpen, setVibratorOpen] = useState(false);
@@ -67,15 +68,75 @@ export default function VideoCard({ video }: VideoCardProps) {
 
   // Recording
   const [isRecording, setIsRecording] = useState(false);
-  const recorderRef  = useRef<MediaRecorder | null>(null);
-  const chunksRef    = useRef<Blob[]>([]);
-  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  const [recDuration, setRecDuration] = useState(0);
+  const [saveDialog, setSaveDialog]   = useState<{ blob: Blob; duration: number } | null>(null);
+  const recorderRef   = useRef<MediaRecorder | null>(null);
+  const chunksRef     = useRef<Blob[]>([]);
+  const recStartRef   = useRef<number>(0);
+  const recTimerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
+  const audioCtxRef   = useRef<AudioContext | null>(null);
+  const audioDestRef  = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const audioSrcRef   = useRef<MediaElementAudioSourceNode | null>(null);
+  const gainNodeRef   = useRef<GainNode | null>(null);
+  const [videoEl, setVideoEl]         = useState<HTMLVideoElement | null>(null);
+  const [isMuted, setIsMuted]         = useState(true);
 
   const flyLaunchRef = useRef<((gift: GiftItem, fromName?: string) => void) | null>(null);
   const pkTimerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Rotating notices (HOT51 LiveNoticeDialog)
+  // Keep isMuted in sync with the LivePlayer-controlled video
+  // LivePlayer exposes muted state via onMutedChange; we track it here for recording
   useEffect(() => {
+    if (!videoEl) return;
+    const check = () => setIsMuted(videoEl.muted);
+    videoEl.addEventListener("volumechange", check);
+    return () => videoEl.removeEventListener("volumechange", check);
+  }, [videoEl]);
+
+  // Setup AudioContext tap — captures audio from the video element regardless of muted state
+  // This ensures recordings always include audio even when the user has video muted
+  const setupAudioCapture = useCallback((el: HTMLVideoElement) => {
+    if (audioCtxRef.current) return; // already set up
+    try {
+      const ctx = new AudioContext();
+      const dest = ctx.createMediaStreamDestination();
+      const gain = ctx.createGain();
+      const src  = ctx.createMediaElementSource(el);
+
+      // Route: source → gain (controls user volume) → speakers
+      src.connect(gain);
+      gain.connect(ctx.destination);
+
+      // Separately tap: source → recording destination (always active, never muted)
+      src.connect(dest);
+
+      audioCtxRef.current  = ctx;
+      audioDestRef.current = dest;
+      audioSrcRef.current  = src;
+      gainNodeRef.current  = gain;
+    } catch (e) {
+      console.warn("AudioContext setup failed:", e);
+    }
+  }, []);
+
+  const handleVideoElement = useCallback((el: HTMLVideoElement | null) => {
+    setVideoEl(el);
+    if (el) setupAudioCapture(el);
+  }, [setupAudioCapture]);
+
+  useEffect(() => {
+    return () => {
+      audioCtxRef.current?.close();
+      audioCtxRef.current  = null;
+      audioDestRef.current = null;
+      audioSrcRef.current  = null;
+      gainNodeRef.current  = null;
+    };
+  }, []);
+
+  // Rotating notices
+  useEffect(() => {
+    if (NOTICE_MSGS.length === 0) return;
     const t = setInterval(() => {
       setNotice(NOTICE_MSGS[noticeIdx % NOTICE_MSGS.length]);
       setNoticeIdx((i) => i + 1);
@@ -150,40 +211,86 @@ export default function VideoCard({ video }: VideoCardProps) {
     setTimeout(() => setExtraMsg(null), 100);
   }, []);
 
-  // ── Recording ───────────────────────────────────────────────────────
+  // Send real comment to Hot51
+  const handleSendComment = useCallback(async (text: string): Promise<boolean> => {
+    if (!video.anchorId && !video.id) return false;
+    try {
+      const res = await fetch(`${BASE}/api/send-comment`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          anchorId: video.anchorId ?? video.id,
+          liveId: video.liveId ?? video.id,
+          content: text,
+        }),
+      });
+      const data = await res.json() as { success: boolean };
+      return data.success === true;
+    } catch {
+      return false;
+    }
+  }, [video.anchorId, video.liveId, video.id]);
+
+  // ── Recording ───────────────────────────────────────────────────────────────
   const startRecording = useCallback(() => {
     if (!videoEl) return;
+
     try {
-      const stream = (videoEl as HTMLVideoElement & { captureStream?: () => MediaStream }).captureStream?.();
-      if (!stream) { alert("Browser ini tidak mendukung perekaman stream"); return; }
-      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9")
-        ? "video/webm;codecs=vp9"
-        : MediaRecorder.isTypeSupported("video/webm")
-          ? "video/webm"
-          : "";
-      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+      // Capture video track from the video element's stream
+      const videoStream = (videoEl as HTMLVideoElement & { captureStream?: () => MediaStream }).captureStream?.();
+      if (!videoStream) { alert("Browser ini tidak mendukung perekaman stream"); return; }
+
+      // Build the final recording stream:
+      // - Video tracks from the live video element
+      // - Audio tracks from the AudioContext tap (always present, even when video is muted)
+      const recStream = new MediaStream();
+
+      // Add video tracks
+      videoStream.getVideoTracks().forEach(t => recStream.addTrack(t));
+
+      // Add audio: prefer the AudioContext destination (captures audio regardless of muted state)
+      if (audioDestRef.current) {
+        const audioCtx = audioCtxRef.current;
+        if (audioCtx?.state === "suspended") audioCtx.resume().catch(() => {});
+        audioDestRef.current.stream.getAudioTracks().forEach(t => recStream.addTrack(t));
+      } else {
+        // Fallback: use audio from captureStream (may or may not work when muted)
+        videoStream.getAudioTracks().forEach(t => recStream.addTrack(t));
+      }
+
+      const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp9,opus")
+        ? "video/webm;codecs=vp9,opus"
+        : MediaRecorder.isTypeSupported("video/webm;codecs=vp8,opus")
+          ? "video/webm;codecs=vp8,opus"
+          : MediaRecorder.isTypeSupported("video/webm")
+            ? "video/webm"
+            : "";
+
+      const recorder = new MediaRecorder(recStream, mimeType ? { mimeType } : {});
       chunksRef.current = [];
       recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
       recorder.onstop = () => {
         const blob = new Blob(chunksRef.current, { type: "video/webm" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `hot51-live-${video.username}-${Date.now()}.webm`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        const duration = Math.round((Date.now() - recStartRef.current) / 1000);
+        setSaveDialog({ blob, duration });
       };
       recorder.start(1000);
       recorderRef.current = recorder;
+      recStartRef.current = Date.now();
       setIsRecording(true);
+      setRecDuration(0);
+
+      recTimerRef.current = setInterval(() => {
+        setRecDuration(Math.round((Date.now() - recStartRef.current) / 1000));
+      }, 1000);
     } catch (err) {
       console.error("Recording error:", err);
+      alert("Gagal memulai rekaman: " + String(err));
     }
-  }, [videoEl, video.username]);
+  }, [videoEl]);
 
   const stopRecording = useCallback(() => {
+    if (recTimerRef.current) { clearInterval(recTimerRef.current); recTimerRef.current = null; }
     recorderRef.current?.stop();
     recorderRef.current = null;
     setIsRecording(false);
@@ -194,6 +301,59 @@ export default function VideoCard({ video }: VideoCardProps) {
     if (isRecording) stopRecording();
     else startRecording();
   }, [isRecording, startRecording, stopRecording]);
+
+  const saveToDevice = useCallback(() => {
+    if (!saveDialog) return;
+    const url = URL.createObjectURL(saveDialog.blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `hot51-live-${video.username}-${Date.now()}.webm`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setSaveDialog(null);
+  }, [saveDialog, video.username]);
+
+  const saveToDatabase = useCallback(async () => {
+    if (!saveDialog) return;
+    try {
+      // Upload the blob as FormData to the API
+      const formData = new FormData();
+      formData.append("file", saveDialog.blob, `hot51-live-${video.username}-${Date.now()}.webm`);
+      formData.append("anchorId", video.anchorId ?? video.id);
+      formData.append("username", video.username);
+      formData.append("duration", String(saveDialog.duration));
+      formData.append("size", String(saveDialog.blob.size));
+
+      // Save metadata to the server
+      const res = await fetch(`${BASE}/api/save-recording`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          anchorId: video.anchorId ?? video.id,
+          username: video.username,
+          duration: saveDialog.duration,
+          size: saveDialog.blob.size,
+        }),
+      });
+      const data = await res.json() as { success: boolean; recording?: { id: string } };
+      if (data.success) {
+        alert(`✅ Rekaman tersimpan di database!\nID: ${data.recording?.id ?? "-"}\nDurasi: ${saveDialog.duration}s`);
+      } else {
+        alert("Gagal menyimpan ke database");
+      }
+    } catch (err) {
+      alert("Error: " + String(err));
+    }
+    setSaveDialog(null);
+  }, [saveDialog, video]);
+
+  const formatDuration = (s: number) => {
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return `${m}:${sec.toString().padStart(2, "0")}`;
+  };
 
   return (
     <div
@@ -217,7 +377,7 @@ export default function VideoCard({ video }: VideoCardProps) {
           hlsUrl={video.hlsUrl}
           cover={video.coverUrl}
           className="absolute inset-0"
-          onVideoElement={setVideoEl}
+          onVideoElement={handleVideoElement}
         />
       ) : video.coverUrl ? (
         <img
@@ -263,7 +423,7 @@ export default function VideoCard({ video }: VideoCardProps) {
       {/* ── HOT51: Flying Gifts ── */}
       <Hot51FlyingGifts onTrigger={handleFlyTrigger} />
 
-      {/* ── LIVE badge + viewers ── */}
+      {/* ── LIVE badge + viewers (top-left) ── */}
       {video.isLive && !pkActive && (
         <div className="absolute top-[65px] left-4 z-20 flex items-center gap-1.5">
           <span
@@ -279,18 +439,29 @@ export default function VideoCard({ video }: VideoCardProps) {
               {video.likes}
             </span>
           )}
-          {/* Recording indicator */}
           {isRecording && (
             <span className="flex items-center gap-1 px-2 py-0.5 rounded-full text-white text-[10px] font-bold"
               style={{ background: "rgba(238,29,82,0.85)" }}>
               <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
-              REC
+              REC {formatDuration(recDuration)}
             </span>
           )}
         </div>
       )}
 
-      {/* ── HOT51: Room Notice (LiveNoticeDialog) ── */}
+      {/* ── HOT51: Coin display — moved to top-left area below LIVE badge to avoid blocking volume ── */}
+      <div className="absolute z-20 flex items-center gap-1 px-2 py-1 rounded-full"
+        style={{
+          top: video.isLive ? "95px" : "65px",
+          left: "16px",
+          background: "rgba(0,0,0,0.5)",
+          backdropFilter: "blur(6px)",
+        }}>
+        <span className="text-yellow-400 text-[11px]">🪙</span>
+        <span className="text-yellow-300 text-[10px] font-bold">{coins.toLocaleString()}</span>
+      </div>
+
+      {/* ── HOT51: Room Notice ── */}
       <AnimatePresence>
         {notice && (
           <motion.div
@@ -310,13 +481,6 @@ export default function VideoCard({ video }: VideoCardProps) {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* ── HOT51: Coin display (top right) ── */}
-      <div className="absolute top-[65px] right-3 z-20 flex items-center gap-1 px-2 py-1 rounded-full"
-        style={{ background: "rgba(0,0,0,0.5)", backdropFilter: "blur(6px)" }}>
-        <span className="text-yellow-400 text-[11px]">🪙</span>
-        <span className="text-yellow-300 text-[10px] font-bold">{coins.toLocaleString()}</span>
-      </div>
 
       {/* ── Right action bar ── */}
       <div className="absolute right-3 bottom-[70px] z-20 flex flex-col items-center gap-4">
@@ -361,7 +525,11 @@ export default function VideoCard({ video }: VideoCardProps) {
         </motion.button>
 
         {/* Comment */}
-        <button data-testid={`button-comment-${video.id}`} className="flex flex-col items-center gap-1">
+        <button
+          data-testid={`button-comment-${video.id}`}
+          className="flex flex-col items-center gap-1"
+          onClick={(e) => { e.stopPropagation(); }}
+        >
           <MessageCircle size={32} color="white" strokeWidth={1.5} />
           <span className="text-white text-xs font-semibold drop-shadow">{video.comments}</span>
         </button>
@@ -376,7 +544,7 @@ export default function VideoCard({ video }: VideoCardProps) {
           <span className="text-white text-xs font-semibold drop-shadow">{shareCount}</span>
         </button>
 
-        {/* HOT51: Gift button (GiftListFragment) */}
+        {/* Gift button */}
         <motion.button
           whileTap={{ scale: 1.2 }}
           onClick={(e) => { e.stopPropagation(); setGiftOpen(true); }}
@@ -391,7 +559,7 @@ export default function VideoCard({ video }: VideoCardProps) {
           <span className="text-white text-[10px] font-semibold drop-shadow">Gift</span>
         </motion.button>
 
-        {/* HOT51: Lovense Vibrator button */}
+        {/* Lovense Vibrator button */}
         <motion.button
           whileTap={{ scale: 1.15 }}
           onClick={(e) => { e.stopPropagation(); setVibratorOpen(true); }}
@@ -410,7 +578,7 @@ export default function VideoCard({ video }: VideoCardProps) {
           <span className="text-white text-[10px] font-semibold drop-shadow">Toy</span>
         </motion.button>
 
-        {/* HOT51: PK Battle button */}
+        {/* PK Battle button */}
         <motion.button
           whileTap={{ scale: 1.15 }}
           onClick={(e) => { e.stopPropagation(); startPK(); }}
@@ -429,7 +597,7 @@ export default function VideoCard({ video }: VideoCardProps) {
           <span className="text-white text-[10px] font-semibold drop-shadow">{pkActive ? "PK Live" : "PK"}</span>
         </motion.button>
 
-        {/* HOT51: Record button */}
+        {/* Record button */}
         <motion.button
           whileTap={{ scale: 1.15 }}
           onClick={toggleRecording}
@@ -479,12 +647,14 @@ export default function VideoCard({ video }: VideoCardProps) {
         </div>
       </div>
 
-      {/* ── HOT51: Live Chat (real-time SSE + demo) ── */}
+      {/* ── HOT51: Live Chat (real-time SSE, tanpa demo) ── */}
       <Hot51LiveChat
         streamerName={video.username}
         active={video.isLive ?? false}
         anchorId={video.anchorId ?? video.id}
+        liveId={video.liveId ?? video.id}
         extraMsg={extraMsg}
+        onSendComment={handleSendComment}
       />
 
       {/* ── HOT51: Gift Panel ── */}
@@ -492,6 +662,8 @@ export default function VideoCard({ video }: VideoCardProps) {
         open={giftOpen}
         onClose={() => setGiftOpen(false)}
         coins={coins}
+        anchorId={video.anchorId ?? video.id}
+        liveId={video.liveId ?? video.id}
         onSend={handleSendGift}
         onSpin={handleSpin}
       />
@@ -513,6 +685,65 @@ export default function VideoCard({ video }: VideoCardProps) {
         streamerName={video.username}
         onChatMsg={handleVibratorChat}
       />
+
+      {/* ── Save Recording Dialog ── */}
+      <AnimatePresence>
+        {saveDialog && (
+          <motion.div
+            className="absolute inset-0 z-50 flex items-center justify-center px-6"
+            style={{ background: "rgba(0,0,0,0.75)", backdropFilter: "blur(8px)" }}
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+          >
+            <motion.div
+              initial={{ scale: 0.9, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              exit={{ scale: 0.9, y: 20 }}
+              className="w-full max-w-xs rounded-2xl overflow-hidden"
+              style={{ background: "rgba(16,16,24,0.98)", border: "1px solid rgba(255,255,255,0.1)" }}
+            >
+              <div className="px-5 pt-5 pb-4">
+                <div className="w-12 h-12 rounded-full flex items-center justify-center mx-auto mb-3"
+                  style={{ background: "linear-gradient(135deg,#EE1D52,#FF6B9D)" }}>
+                  <Circle size={22} color="white" fill="white" />
+                </div>
+                <h3 className="text-white font-bold text-base text-center mb-1">Rekaman Selesai</h3>
+                <p className="text-white/50 text-xs text-center mb-4">
+                  Durasi: {formatDuration(saveDialog.duration)} • {(saveDialog.blob.size / 1024 / 1024).toFixed(1)} MB
+                </p>
+
+                <div className="flex flex-col gap-2">
+                  <motion.button
+                    whileTap={{ scale: 0.97 }}
+                    onClick={saveToDevice}
+                    className="w-full py-3 rounded-xl flex items-center justify-center gap-2 text-sm font-bold text-white"
+                    style={{ background: "linear-gradient(135deg,#4776E6,#8E54E9)" }}
+                  >
+                    <Download size={16} />
+                    Simpan ke Perangkat
+                  </motion.button>
+                  <motion.button
+                    whileTap={{ scale: 0.97 }}
+                    onClick={saveToDatabase}
+                    className="w-full py-3 rounded-xl flex items-center justify-center gap-2 text-sm font-bold text-white"
+                    style={{ background: "linear-gradient(135deg,#11998e,#38ef7d)" }}
+                  >
+                    <Database size={16} />
+                    Simpan ke Database
+                  </motion.button>
+                  <button
+                    onClick={() => setSaveDialog(null)}
+                    className="w-full py-2 text-white/40 text-xs"
+                  >
+                    Buang
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

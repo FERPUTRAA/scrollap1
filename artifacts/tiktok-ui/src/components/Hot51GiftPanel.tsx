@@ -1,6 +1,6 @@
 import React, { useState, useCallback, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Gift } from "lucide-react";
+import { X, Gift, CheckCircle, AlertCircle } from "lucide-react";
 
 export interface GiftItem {
   id: string;
@@ -28,16 +28,20 @@ interface Props {
   open: boolean;
   onClose: () => void;
   coins: number;
+  anchorId: string;
+  liveId: string;
   onSend: (gift: GiftItem, flyX: number) => void;
   onSpin: () => void;
 }
 
-export default function Hot51GiftPanel({ open, onClose, coins, onSend, onSpin }: Props) {
+export default function Hot51GiftPanel({ open, onClose, coins, anchorId, liveId, onSend, onSpin }: Props) {
   const [gifts, setGifts] = useState<GiftItem[]>(FALLBACK_GIFTS);
   const [selected, setSelected] = useState<GiftItem>(FALLBACK_GIFTS[0]);
   const [qty, setQty] = useState(1);
   const [tab, setTab] = useState<"gift" | "pkg">("gift");
   const [loadingGifts, setLoadingGifts] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendResult, setSendResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -62,10 +66,38 @@ export default function Hot51GiftPanel({ open, onClose, coins, onSend, onSpin }:
       .finally(() => setLoadingGifts(false));
   }, [open]);
 
-  const handleSend = useCallback(() => {
-    if (coins < selected.coins * qty) return;
+  const handleSend = useCallback(async () => {
+    if (coins < selected.coins * qty || sending) return;
+
+    setSending(true);
+    setSendResult(null);
+
     onSend(selected, 50);
-  }, [selected, qty, coins, onSend]);
+
+    try {
+      const res = await fetch(`${BASE}/api/send-gift`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          anchorId,
+          liveId,
+          giftId: selected.id,
+          giftNum: qty,
+        }),
+      });
+      const data = await res.json() as { success: boolean; error?: string };
+      if (data.success) {
+        setSendResult({ ok: true, msg: `✅ ${qty > 1 ? `${qty}x ` : ""}${selected.name} terkirim ke host!` });
+      } else {
+        setSendResult({ ok: false, msg: data.error ?? "Perlu login akun Hot51 untuk kirim gift nyata" });
+      }
+    } catch {
+      setSendResult({ ok: false, msg: "Perlu login akun Hot51 untuk kirim gift nyata" });
+    } finally {
+      setSending(false);
+      setTimeout(() => setSendResult(null), 3500);
+    }
+  }, [selected, qty, coins, anchorId, liveId, onSend, sending]);
 
   const canAfford = coins >= selected.coins * qty;
 
@@ -94,7 +126,7 @@ export default function Hot51GiftPanel({ open, onClose, coins, onSend, onSpin }:
                   onClick={() => setTab("gift")}
                   className={`text-sm font-bold pb-1 border-b-2 transition-colors ${tab === "gift" ? "text-white border-[#EE1D52]" : "text-white/40 border-transparent"}`}
                 >
-                  Gift {loadingGifts && <span className="text-[9px] text-white/30 ml-1">...</span>}
+                  Gift {loadingGifts && <span className="text-[9px] text-white/30 ml-1">memuat...</span>}
                 </button>
                 <button
                   onClick={() => setTab("pkg")}
@@ -138,6 +170,24 @@ export default function Hot51GiftPanel({ open, onClose, coins, onSend, onSpin }:
                   ))}
                 </div>
 
+                <AnimatePresence>
+                  {sendResult && (
+                    <motion.div
+                      initial={{ opacity: 0, y: -4 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      exit={{ opacity: 0 }}
+                      className="mx-3 mb-2 px-3 py-2 rounded-xl flex items-center gap-2"
+                      style={{ background: sendResult.ok ? "rgba(34,197,94,0.15)" : "rgba(238,29,82,0.15)", border: `1px solid ${sendResult.ok ? "rgba(34,197,94,0.3)" : "rgba(238,29,82,0.3)"}` }}
+                    >
+                      {sendResult.ok
+                        ? <CheckCircle size={14} color="#22c55e" />
+                        : <AlertCircle size={14} color="#EE1D52" />
+                      }
+                      <span className="text-xs" style={{ color: sendResult.ok ? "#86efac" : "#fca5a5" }}>{sendResult.msg}</span>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
                 <div className="flex items-center gap-2 px-3 pb-3 pt-1">
                   <div className="flex items-center gap-1 rounded-lg overflow-hidden" style={{ background: "rgba(255,255,255,0.07)" }}>
                     {[1, 5, 10, 99].map((q) => (
@@ -154,11 +204,15 @@ export default function Hot51GiftPanel({ open, onClose, coins, onSend, onSpin }:
                   <motion.button
                     whileTap={{ scale: 0.96 }}
                     onClick={handleSend}
+                    disabled={!canAfford || sending}
                     className="flex-1 py-2 rounded-xl text-sm font-bold text-white flex items-center justify-center gap-1.5"
-                    style={{ background: canAfford ? selected.color : "rgba(255,255,255,0.12)" }}
+                    style={{ background: canAfford && !sending ? selected.color : "rgba(255,255,255,0.12)" }}
                   >
-                    <Gift size={15} />
-                    Kirim {qty > 1 ? `×${qty}` : ""}
+                    {sending ? (
+                      <motion.span animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 0.7, ease: "linear" }}>🎁</motion.span>
+                    ) : (
+                      <><Gift size={15} />Kirim {qty > 1 ? `×${qty}` : ""}</>
+                    )}
                   </motion.button>
                   <motion.button
                     whileTap={{ scale: 0.96 }}

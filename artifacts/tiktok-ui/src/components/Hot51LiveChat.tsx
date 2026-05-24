@@ -23,21 +23,21 @@ interface Props {
   streamerName: string;
   active: boolean;
   anchorId?: string;
+  liveId?: string;
   extraMsg?: ChatMsg | null;
+  onSendComment?: (text: string) => Promise<boolean>;
 }
 
 const USER_COLORS = ["#FF6B9D", "#69C9D0", "#FFD700", "#B44FED", "#FF8C00", "#4776E6", "#11998e", "#EE1D52"];
 function randColor() { return USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)]; }
 
-const NAMES = ["Wulandari", "Rizky", "Sinta", "Dewa", "Ayu", "Budi", "Citra", "Eko", "Fajar", "Gita", "Hani", "Irfan", "Joko", "Kiki", "Lina"];
-
-export default function Hot51LiveChat({ streamerName, active, anchorId, extraMsg }: Props) {
+export default function Hot51LiveChat({ streamerName, active, anchorId, liveId, extraMsg, onSendComment }: Props) {
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [showInput, setShowInput] = useState(false);
   const [connected, setConnected] = useState(false);
+  const [sending, setSending] = useState(false);
   const sseRef = useRef<EventSource | null>(null);
-  const demoTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const addMsg = useCallback((m: ChatMsg) => {
     setMsgs((prev) => {
@@ -55,16 +55,32 @@ export default function Hot51LiveChat({ streamerName, active, anchorId, extraMsg
     if (extraMsg) addMsg(extraMsg);
   }, [extraMsg, addMsg]);
 
-  // Connect SSE for real-time comments/gifts when anchorId is provided
   useEffect(() => {
     if (!active || !anchorId) return;
 
-    const url = `${BASE}/api/live-sse?anchorId=${encodeURIComponent(anchorId)}`;
+    const params = new URLSearchParams({ anchorId });
+    if (liveId) params.set("liveId", liveId);
+    const url = `${BASE}/api/live-sse?${params.toString()}`;
     const es = new EventSource(url);
     sseRef.current = es;
 
     es.addEventListener("connected", () => {
       setConnected(true);
+    });
+
+    es.addEventListener("ws_found", () => {
+      addMsg(makeSystemMsg("Chat real-time terhubung ✓"));
+    });
+
+    es.addEventListener("ws_missing", (e: MessageEvent) => {
+      try {
+        const d = JSON.parse(e.data) as { note?: string };
+        addMsg(makeSystemMsg(d.note ?? "WebSocket tidak tersedia"));
+      } catch {}
+    });
+
+    es.addEventListener("ws_disconnected", () => {
+      addMsg(makeSystemMsg("Chat terputus, mencoba ulang..."));
     });
 
     es.addEventListener("chat", (e: MessageEvent) => {
@@ -113,45 +129,34 @@ export default function Hot51LiveChat({ streamerName, active, anchorId, extraMsg
       sseRef.current = null;
       setConnected(false);
     };
-  }, [active, anchorId, addMsg]);
+  }, [active, anchorId, liveId, addMsg]);
 
-  // Demo messages when not connected to real SSE
-  useEffect(() => {
-    if (!active) return;
-    if (connected) return; // Real SSE active — no demo
+  const sendChat = useCallback(async () => {
+    const text = input.trim();
+    if (!text || sending) return;
 
-    const DEMO_MSGS = [
-      () => ({ type: "join" as const,  user: NAMES[Math.floor(Math.random() * NAMES.length)], text: "bergabung", color: "rgba(255,255,255,0.45)", emoji: "👋" }),
-      () => ({ type: "chat" as const,  user: NAMES[Math.floor(Math.random() * NAMES.length)], text: ["Hai kak 👋", "Cantik banget!", "Salam dari Jakarta", "Live terus ya kak", "❤️❤️❤️", "Mantap!"][Math.floor(Math.random() * 6)], color: randColor() }),
-      () => ({ type: "gift" as const,  user: NAMES[Math.floor(Math.random() * NAMES.length)], text: "memberi Mawar", color: "#FFD700", emoji: "🌹" }),
-      () => ({ type: "gift" as const,  user: NAMES[Math.floor(Math.random() * NAMES.length)], text: "memberi Diamond", color: "#69C9D0", emoji: "💎" }),
-    ];
-
-    demoTimerRef.current = setInterval(() => {
-      const fn = DEMO_MSGS[Math.floor(Math.random() * DEMO_MSGS.length)];
-      addMsg({ id: msgIdCounter++, ...fn() });
-    }, 2200 + Math.random() * 1800);
-
-    return () => {
-      if (demoTimerRef.current) clearInterval(demoTimerRef.current);
-    };
-  }, [active, connected, addMsg]);
-
-  const sendChat = () => {
-    if (!input.trim()) return;
-    addMsg({ id: msgIdCounter++, type: "chat", user: "Saya", text: input.trim(), color: "#69C9D0" });
+    setSending(true);
+    const optimisticMsg: ChatMsg = { id: msgIdCounter++, type: "chat", user: "Saya", text, color: "#69C9D0" };
+    addMsg(optimisticMsg);
     setInput("");
     setShowInput(false);
-  };
+
+    if (onSendComment) {
+      const ok = await onSendComment(text);
+      if (!ok) {
+        addMsg(makeSystemMsg("⚠️ Komentar gagal dikirim (perlu login Hot51)"));
+      }
+    }
+    setSending(false);
+  }, [input, sending, addMsg, onSendComment]);
 
   return (
     <div className="absolute bottom-[55px] left-0 right-0 z-20 flex flex-col px-2 pointer-events-none" style={{ maxHeight: "42vh" }}>
-      {/* Connection indicator */}
       {anchorId && (
         <div className="flex items-center gap-1 mb-1 self-start">
-          <span className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-green-400" : "bg-yellow-400"} animate-pulse`} />
+          <span className={`w-1.5 h-1.5 rounded-full ${connected ? "bg-green-400" : "bg-orange-400"} animate-pulse`} />
           <span className="text-[9px]" style={{ color: "rgba(255,255,255,0.35)" }}>
-            {connected ? "Live" : "Demo"}
+            {connected ? "Live" : "Menghubungkan..."}
           </span>
         </div>
       )}
@@ -208,8 +213,14 @@ export default function Hot51LiveChat({ streamerName, active, anchorId, extraMsg
                 className="flex-1 bg-transparent text-white text-sm outline-none placeholder-white/40"
                 style={{ fontSize: "13px" }}
               />
-              <motion.button whileTap={{ scale: 0.9 }} onClick={sendChat}>
-                <Send size={16} color="#EE1D52" />
+              <motion.button whileTap={{ scale: 0.9 }} onClick={sendChat} disabled={sending}>
+                {sending ? (
+                  <motion.span animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 0.6, ease: "linear" }}>
+                    <Send size={16} color="rgba(238,29,82,0.5)" />
+                  </motion.span>
+                ) : (
+                  <Send size={16} color="#EE1D52" />
+                )}
               </motion.button>
             </motion.div>
           ) : (

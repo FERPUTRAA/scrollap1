@@ -2013,6 +2013,43 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
   }
 });
 
+/** POST /api/send-comment — kirim komentar ke live stream */
+liveRouter.post("/send-comment", async (req: Request, res: Response) => {
+  if (!session) {
+    res.status(401).json({ success: false, error: "Perlu login — set HOT51_AC + HOT51_SIGN di Secrets" });
+    return;
+  }
+  const { anchorId, liveId, content } = (req.body ?? {}) as {
+    anchorId?: string; liveId?: string; content?: string;
+  };
+  if (!anchorId || !liveId || !content?.trim()) {
+    res.status(400).json({ success: false, error: "Perlu anchorId, liveId, dan content" });
+    return;
+  }
+  const endpoints = [
+    `${HOT51_BASE}/${MERCHANT_ID}/api/plr/comment/send`,
+    `${HOT51_BASE}/${MERCHANT_ID}/api/plr/live/comment`,
+  ];
+  for (const url of endpoints) {
+    try {
+      const body = JSON.stringify({ anchorId, liveId, content: content.trim() });
+      const data = await hotFetch(url, {
+        method: "POST",
+        headers: getPostHeaders(body),
+        body,
+        timeoutMs: 8_000,
+      });
+      if (data && typeof data === "object") {
+        // Broadcast the comment to all SSE listeners for this room
+        broadcastRoom(anchorId, "chat", { nickname: "Saya", content: content.trim() });
+        res.json({ success: true, data });
+        return;
+      }
+    } catch { continue; }
+  }
+  res.json({ success: false, error: "Gagal mengirim komentar" });
+});
+
 /** GET /api/recordings — daftar rekaman yang tersimpan */
 const recordings: Array<{ id: string; anchorId: string; username: string; ts: number; duration: number; size: number }> = [];
 
