@@ -1540,14 +1540,26 @@ liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
 
   req.log.info({ url: rawUrl }, "hls-proxy start");
 
-  // Build ordered list of URLs to try: primary first, then CDN domain fallbacks
+  // Build ordered list of URLs to try: CF worker first (most reliable), then proxy pool fallbacks
+  const isCdnUrl = rawUrl.includes("cdnsi.com") || rawUrl.includes("livcdn.com") || rawUrl.includes("baccdn.com");
+  const cfWrapped = CF_WORKER_URL && isCdnUrl ? wrapWithCfWorker(rawUrl) : null;
   const urlsToTry = [rawUrl, ...buildCdnFallbackUrls(rawUrl)];
 
   try {
     let result: { res: Awaited<ReturnType<typeof undiciFetch>>; proxy: string | null } | null = null;
     let usedUrl = rawUrl;
 
+    // STEP 0: Try CF worker first — fastest and most reliable for CDN URLs
+    if (cfWrapped) {
+      try {
+        const r = await undiciFetch(cfWrapped, { headers: cdnHeaders, signal: AbortSignal.timeout(8_000) });
+        if (r.ok) { result = { res: r, proxy: "cf-worker" }; usedUrl = rawUrl; }
+        else r.body?.cancel().catch(() => {});
+      } catch { /* fall through to proxy pool */ }
+    }
+
     for (const candidateUrl of urlsToTry) {
+      if (result) break;
       result = await fetchViaBestProxy(candidateUrl, cdnHeaders, 14_000);
       if (result?.res.ok) { usedUrl = candidateUrl; break; }
       // Non-ok but got response — log and try next CDN domain
@@ -1638,7 +1650,22 @@ liveRouter.get("/ts-proxy", async (req: Request, res: Response) => {
   };
 
   try {
-    const result = await fetchViaBestProxy(rawUrl, cdnHeaders, 15_000);
+    const isTsCdn = rawUrl.includes("cdnsi.com") || rawUrl.includes("livcdn.com") || rawUrl.includes("baccdn.com");
+    const cfTs = CF_WORKER_URL && isTsCdn ? wrapWithCfWorker(rawUrl) : null;
+
+    let result: { res: Awaited<ReturnType<typeof undiciFetch>>; proxy: string | null } | null = null;
+
+    // Try CF worker first for CDN segments — fastest path
+    if (cfTs) {
+      try {
+        const r = await undiciFetch(cfTs, { headers: cdnHeaders, signal: AbortSignal.timeout(8_000) });
+        if (r.ok) result = { res: r, proxy: "cf-worker" };
+        else r.body?.cancel().catch(() => {});
+      } catch { /* fall through */ }
+    }
+
+    if (!result) result = await fetchViaBestProxy(rawUrl, cdnHeaders, 15_000);
+
     if (!result || !result.res.body) {
       res.status(502).send("");
       return;
