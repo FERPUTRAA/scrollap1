@@ -33,7 +33,7 @@ args = "PORT=8080 BASE_PATH=/ pnpm run --filter @workspace/api-server dev & PORT
 waitForPort = 8080
 
 [agent]
-stack = "PNPM_WORKSPACE"
+stack = "BEST_EFFORT_FALLBACK"
 expertMode = true
 
 [postMerge]
@@ -71,10 +71,6 @@ externalPort = 4200
 [userenv]
 
 [userenv.shared]
-AGORA_APP_CERTIFICATE = "6dfd8bd4e2364fa4a57c01ec9757178e"
-AGORA_CUSTOMER_ID = "e5963aaa320545b4a9ce873f3fbe9627"
-HOT51_STREAM_KEY = "4ad75f5e2eb06d315ea14e8484a29e1d"
-HOT51_CF_WORKER_URL = "https://hot51-proxy.feryputrafer.workers.dev"
 
 [nix]
 channel = "stable-25_05"
