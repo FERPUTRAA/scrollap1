@@ -1,37 +1,40 @@
 #!/bin/bash
-set -e
 
-# ── Tailscale (background) ──────────────────────────────────────────────────
-echo "[tailscale] Starting..."
-mkdir -p /tmp/tailscale-state
-pkill tailscaled 2>/dev/null; sleep 1
+TAILSCALED=/nix/store/xdqdr208nmr26a0wpbm7p9qb5db3s5xb-tailscale-1.82.5/bin/tailscaled
+TAILSCALE=/nix/store/xdqdr208nmr26a0wpbm7p9qb5db3s5xb-tailscale-1.82.5/bin/tailscale
 
-tailscaled \
-  --tun=userspace-networking \
-  --statedir=/tmp/tailscale-state \
-  --socket=/tmp/tailscale.sock \
-  --port=41641 \
-  --socks5-server=localhost:1055 \
-  --outbound-http-proxy-listen=localhost:1056 &
-
-for i in $(seq 1 15); do
+# ── Tailscale — background, non-blocking ─────────────────────────────────────
+(
+  mkdir -p /tmp/tailscale-state
+  pkill tailscaled 2>/dev/null || true
   sleep 1
-  [ -S /tmp/tailscale.sock ] && echo "[tailscale] Socket ready" && break
-done
 
-tailscale --socket=/tmp/tailscale.sock up \
-  --authkey="$TAILSCALE_AUTH_KEY" \
-  --accept-routes \
-  --advertise-exit-node \
-  --hostname="scrollap-server" 2>&1
+  "$TAILSCALED" \
+    --tun=userspace-networking \
+    --statedir=/tmp/tailscale-state \
+    --socket=/tmp/tailscale.sock \
+    --port=41641 \
+    --socks5-server=localhost:1055 \
+    --outbound-http-proxy-listen=localhost:1056 \
+    2>/tmp/tailscaled.log &
 
-tailscale --socket=/tmp/tailscale.sock set --advertise-exit-node 2>/dev/null || true
-echo "[tailscale] Connected — IP: $(tailscale --socket=/tmp/tailscale.sock ip -4 2>/dev/null)"
+  for i in $(seq 1 20); do
+    sleep 1
+    [ -S /tmp/tailscale.sock ] && break
+  done
 
-# ── API Server (background) ─────────────────────────────────────────────────
+  if [ -S /tmp/tailscale.sock ]; then
+    "$TAILSCALE" --socket=/tmp/tailscale.sock up \
+      --authkey="$TAILSCALE_AUTH_KEY" \
+      --accept-routes \
+      --advertise-exit-node \
+      --hostname="scrollap-server" 2>&1 || true
+    "$TAILSCALE" --socket=/tmp/tailscale.sock set --advertise-exit-node 2>/dev/null || true
+    echo "[tailscale] IP: $("$TAILSCALE" --socket=/tmp/tailscale.sock ip -4 2>/dev/null || echo 'pending')"
+  fi
+) &
+
+# ── API Server — foreground (keeps workflow alive, port 8080) ─────────────────
 echo "[api] Starting on port 8080..."
-PORT=8080 pnpm run --filter @workspace/api-server dev &
-
-# ── Web UI (foreground — keeps container alive) ─────────────────────────────
-echo "[web] Starting on port 5000..."
-exec PORT=5000 BASE_PATH=/ pnpm run --filter @workspace/tiktok-ui dev
+export PORT=8080
+exec pnpm run --filter @workspace/api-server dev

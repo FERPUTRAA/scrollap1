@@ -2,8 +2,8 @@ import { Router, type Request, type Response } from "express";
 import { fetch as undiciFetch } from "undici";
 import { exec as execCmd } from "node:child_process";
 import { promisify } from "node:util";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
-import { resolve, dirname } from "node:path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { resolve, dirname, relative } from "node:path";
 import { execSync } from "node:child_process";
 
 const execAsync = promisify(execCmd);
@@ -128,6 +128,68 @@ function listFiles(pattern: string): string {
   } catch { return "(pencarian gagal)"; }
 }
 
+function listDir(relPath: string): string {
+  try {
+    const abs = resolve(WORKSPACE, relPath);
+    if (!abs.startsWith(WORKSPACE)) return "Path tidak aman";
+    if (!existsSync(abs)) return `Direktori tidak ditemukan: ${relPath}`;
+    const entries = readdirSync(abs);
+    const lines = entries.slice(0, 60).map(name => {
+      const full = resolve(abs, name);
+      try {
+        const st = statSync(full);
+        const rel = relative(WORKSPACE, full);
+        return st.isDirectory() ? `📁 ${rel}/` : `📄 ${rel}`;
+      } catch { return `? ${name}`; }
+    });
+    return lines.join("\n") || "(kosong)";
+  } catch (e) { return `Error: ${e instanceof Error ? e.message : String(e)}`; }
+}
+
+// ── Web search via DuckDuckGo instant answer ──────────────────────────────────
+async function searchWeb(query: string): Promise<string> {
+  try {
+    const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+    const res = await undiciFetch(url, { signal: AbortSignal.timeout(8_000) });
+    const d = await res.json() as {
+      AbstractText?: string;
+      AbstractURL?:  string;
+      RelatedTopics?: Array<{ Text?: string; FirstURL?: string }>;
+      Answer?: string;
+      AnswerType?: string;
+    };
+    const parts: string[] = [];
+    if (d.Answer) parts.push(`📌 **Jawaban Langsung:** ${d.Answer}`);
+    if (d.AbstractText) parts.push(`📖 **Ringkasan:** ${d.AbstractText}\n🔗 ${d.AbstractURL ?? ""}`);
+    if (d.RelatedTopics && d.RelatedTopics.length > 0) {
+      const topics = d.RelatedTopics
+        .filter(t => t.Text)
+        .slice(0, 5)
+        .map(t => `• ${t.Text}${t.FirstURL ? ` (${t.FirstURL})` : ""}`);
+      if (topics.length) parts.push(`📎 **Topik Terkait:**\n${topics.join("\n")}`);
+    }
+    if (parts.length === 0) {
+      // Fallback: try a basic HTML search for snippet
+      try {
+        const htmlRes = await undiciFetch(
+          `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`,
+          { headers: { "User-Agent": "Mozilla/5.0 Scrollap-DevChat/1.0" }, signal: AbortSignal.timeout(8_000) },
+        );
+        const html = await htmlRes.text();
+        const snippetMatch = html.match(/<a class="result__snippet"[^>]*>([\s\S]{0,400}?)<\/a>/);
+        if (snippetMatch) {
+          const snippet = snippetMatch[1].replace(/<[^>]+>/g, "").trim();
+          return `🌐 **Hasil pencarian untuk "${query}":**\n${snippet}`;
+        }
+      } catch {}
+      return `🔍 Tidak ada hasil instan untuk "${query}". Coba cari dengan kata kunci berbeda.`;
+    }
+    return `🌐 **Pencarian Web: "${query}"**\n\n${parts.join("\n\n")}`;
+  } catch (e) {
+    return `❌ Web search gagal: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 // ── OpenRouter streaming call ──────────────────────────────────────────────────
 async function callQwenStreaming(
   messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
@@ -195,16 +257,16 @@ async function callQwen(
 
 // ── Parse agent action blocks ─────────────────────────────────────────────────
 interface AgentAction {
-  type: "read_file" | "search_code" | "list_files" | "edit_file" | "write_file" | "run_command";
+  type: "read_file" | "search_code" | "list_files" | "list_dir" | "edit_file" | "write_file" | "run_command" | "web_search";
   params: Record<string, string>;
 }
 
 function parseAgentActions(response: string): AgentAction[] {
   const actions: AgentAction[] = [];
+  let m: RegExpExecArray | null;
 
   // <<<READ: path>>>
   const readRe = /<<<READ:\s*(.+?)>>>/g;
-  let m: RegExpExecArray | null;
   while ((m = readRe.exec(response)) !== null) {
     actions.push({ type: "read_file", params: { path: m[1].trim() } });
   }
@@ -222,12 +284,19 @@ function parseAgentActions(response: string): AgentAction[] {
     actions.push({ type: "list_files", params: { pattern: m[1].trim() } });
   }
 
-  // <<<EDIT: path>>>
-  // <<<OLD>>>
-  // old content
-  // <<<NEW>>>
-  // new content
-  // <<<END>>>
+  // <<<LS: path>>> — list directory contents
+  const lsRe = /<<<LS:\s*(.+?)>>>/g;
+  while ((m = lsRe.exec(response)) !== null) {
+    actions.push({ type: "list_dir", params: { path: m[1].trim() } });
+  }
+
+  // <<<WEB: query>>> — web search
+  const webRe = /<<<WEB:\s*(.+?)>>>/g;
+  while ((m = webRe.exec(response)) !== null) {
+    actions.push({ type: "web_search", params: { query: m[1].trim() } });
+  }
+
+  // <<<EDIT: path>>><<<OLD>>>old<<<NEW>>>new<<<END>>>
   const editRe = /<<<EDIT:\s*(.+?)>>>\s*<<<OLD>>>([\s\S]+?)<<<NEW>>>([\s\S]+?)<<<END>>>/g;
   while ((m = editRe.exec(response)) !== null) {
     actions.push({
@@ -270,17 +339,66 @@ function parseAgentActions(response: string): AgentAction[] {
   return actions;
 }
 
+// Strip all tool call blocks from a response, leaving only the human-readable text
 function stripActionBlocks(text: string): string {
   return text
     .replace(/<<<READ:\s*.+?>>>/g, "")
     .replace(/<<<SEARCH:\s*.+?>>>/g, "")
     .replace(/<<<LIST:\s*.+?>>>/g, "")
+    .replace(/<<<LS:\s*.+?>>>/g, "")
+    .replace(/<<<WEB:\s*.+?>>>/g, "")
     .replace(/<<<EDIT:\s*.+?>>>[\s\S]*?<<<END>>>/g, "")
     .replace(/<<<WRITE:\s*.+?>>>[\s\S]*?<<<END>>>/g, "")
     .replace(/<<<CHANGE:\s*.+?>>>[\s\S]*?<<<END>>>/g, "")
     .replace(/<<<RUN:\s*.+?>>>[\s\S]*?<<<END>>>/g, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+// Check if a text chunk is inside a tool-call block (to suppress from live stream)
+function makeToolCallFilter() {
+  let buffer = "";
+  let insideBlock = false;
+
+  return function filter(chunk: string): string {
+    buffer += chunk;
+    let visible = "";
+
+    // Process buffer character by character looking for <<< ... >>>
+    while (buffer.length > 0) {
+      if (!insideBlock) {
+        const start = buffer.indexOf("<<<");
+        if (start === -1) {
+          // No tool call starting — safe to emit all but last 3 chars (might be partial <<<)
+          const safe = buffer.slice(0, Math.max(0, buffer.length - 3));
+          visible += safe;
+          buffer  = buffer.slice(safe.length);
+          break;
+        } else {
+          // Emit text before the <<<
+          visible += buffer.slice(0, start);
+          buffer   = buffer.slice(start);
+          insideBlock = true;
+        }
+      } else {
+        // Look for end of one-liner block (>>>) or multi-line block (<<<END>>>)
+        const inlineEnd = buffer.indexOf(">>>");
+        const blockEnd  = buffer.indexOf("<<<END>>>");
+        if (blockEnd !== -1) {
+          buffer = buffer.slice(blockEnd + 9);
+          insideBlock = false;
+        } else if (inlineEnd !== -1) {
+          // Inline: <<<KEYWORD: value>>>
+          buffer = buffer.slice(inlineEnd + 3);
+          insideBlock = false;
+        } else {
+          // Still accumulating a block — don't emit
+          break;
+        }
+      }
+    }
+    return visible;
+  };
 }
 
 // ── Diagnostic helpers ────────────────────────────────────────────────────────
@@ -486,38 +604,44 @@ Jawab maksimal 400 kata, fokus ROOT CAUSE dan SOLUSI KONKRET.`;
 });
 
 // ── POST /autonomous/chat — Agentic developer chat (Replit Agent style) ────────
-const AGENT_SYSTEM = `Kamu adalah autonomous AI developer assistant untuk proyek Scrollap (TikTok-clone Indonesia) — PERSIS seperti Replit Agent.
+const AGENT_SYSTEM = `Kamu adalah autonomous AI developer — senior hacker berpengalaman yang bekerja pada proyek Scrollap (TikTok-clone live streaming Indonesia). Kamu bertindak PERSIS seperti Replit Agent: baca kode, pahami konteks, lalu buat perubahan nyata yang akurat.
 
-Stack proyek:
-- Frontend web: React + Vite + TailwindCSS (artifacts/tiktok-ui/src/)
-- Mobile: Expo React Native (artifacts/tiktok-ui-mobile/app/)
-- API: Express 5 + TypeScript + Drizzle ORM (artifacts/api-server/src/)
-- Database: PostgreSQL + Drizzle ORM
+## Stack Proyek
+- **Web Frontend:** React + Vite + TailwindCSS → \`artifacts/tiktok-ui/src/\`
+- **Mobile:** Expo React Native → \`artifacts/tiktok-ui-mobile/app/\`
+- **API:** Express 5 + TypeScript + Drizzle ORM → \`artifacts/api-server/src/\`
+- **DB:** PostgreSQL + Drizzle ORM
 
-Struktur file penting:
-- artifacts/tiktok-ui/src/components/ — komponen UI (VideoCard, LivePlayer, Hot51*, DevChat)
-- artifacts/tiktok-ui/src/pages/ — halaman (Feed, Discover, Inbox, Profile)
-- artifacts/api-server/src/routes/ — API routes (live.ts, apk.ts, autonomous.ts, agora.ts, vava.ts)
-- artifacts/api-server/src/index.ts — server entry
+## File Penting
+- \`artifacts/tiktok-ui/src/components/\` — VideoCard, LivePlayer, Hot51*, DevChat
+- \`artifacts/tiktok-ui/src/pages/\` — Feed, Discover, Inbox, Profile
+- \`artifacts/api-server/src/routes/\` — live.ts, apk.ts, autonomous.ts, agora.ts, vava.ts
+- \`artifacts/api-server/src/index.ts\` — server entry
 
-CARA KERJAMU (WAJIB ikuti urutan ini):
-1. BACA file yang relevan dulu — jangan pernah edit tanpa membaca
-2. ANALISIS masalah dan rencanakan perubahan
-3. IMPLEMENTASI perubahan dengan format tool calls
-4. VALIDASI dengan typecheck setelah edit TypeScript
+## Cara Kerja (WAJIB ikuti urutan)
+1. **READ** file yang relevan terlebih dahulu — jangan pernah edit blind
+2. **ANALYZE** masalah, rencanakan perubahan minimal
+3. **IMPLEMENT** dengan format tool calls yang tepat
+4. **VALIDATE** dengan typecheck/build setelah edit TypeScript
 
-FORMAT TOOL CALLS (gunakan PERSIS format ini — jangan ada karakter tambahan):
+## Format Tool Calls
 
 Baca file:
 <<<READ: artifacts/tiktok-ui/src/components/VideoCard.tsx>>>
 
-Cari kode:
+List isi direktori:
+<<<LS: artifacts/tiktok-ui/src/components>>>
+
+Cari kode (grep):
 <<<SEARCH: scrollIntoView | artifacts/tiktok-ui/src>>>
 
-Cari file:
+Cari file by name:
 <<<LIST: *.tsx>>>
 
-Edit presisi (PREFERRED — untuk perubahan kecil):
+**Cari di web** (untuk docs, error messages, library APIs):
+<<<WEB: HLS.js black screen MEDIA_ATTACHED event>>>
+
+Edit presisi — PREFERRED untuk perubahan kecil:
 <<<EDIT: artifacts/tiktok-ui/src/components/Hot51LiveChat.tsx>>>
 <<<OLD>>>
 teks PERSIS yang ada di file (copy-paste, termasuk indentasi)
@@ -525,14 +649,13 @@ teks PERSIS yang ada di file (copy-paste, termasuk indentasi)
 teks pengganti
 <<<END>>>
 
-Tulis file penuh (untuk file BARU atau rewrite total):
+Tulis file penuh — untuk file BARU atau rewrite total:
 <<<WRITE: artifacts/tiktok-ui/src/components/NewComponent.tsx>>>
 import React from "react";
-// konten lengkap
 export default function NewComponent() { return <div/>; }
 <<<END>>>
 
-Jalankan command (untuk build/check):
+Jalankan command:
 <<<RUN: TypeScript typecheck>>>
 pnpm run typecheck
 <<<END>>>
@@ -541,16 +664,16 @@ pnpm run typecheck
 pnpm --filter @workspace/api-server run build
 <<<END>>>
 
-ATURAN WAJIB:
-1. SELALU <<<READ>>> file sebelum <<<EDIT>>> — jangan pernah edit blind
-2. <<<EDIT>>> OLD string harus PERSIS sama (spasi/tab/newline) dengan isi file
-3. Setelah edit TypeScript, jalankan: <<<RUN: typecheck>>>pnpm run typecheck<<<END>>>
-4. Setelah edit API server, jalankan: <<<RUN: build API>>>pnpm --filter @workspace/api-server run build<<<END>>>
+## Aturan Wajib
+1. SELALU \`<<<READ>>>\` sebelum \`<<<EDIT>>>\` — tidak ada pengecualian
+2. \`<<<EDIT>>>\` OLD string harus BYTE-FOR-BYTE sama dengan isi file (spasi, tab, newline)
+3. Setelah edit TypeScript: \`<<<RUN: typecheck>>>pnpm run typecheck<<<END>>>\`
+4. Setelah edit API: \`<<<RUN: build API>>>pnpm --filter @workspace/api-server run build<<<END>>>\`
 5. Satu tool call per tindakan — jangan gabungkan beberapa EDIT dalam satu blok
 6. Jawab dalam Bahasa Indonesia santai tapi profesional
 7. Tulis penjelasan final (tanpa tool calls) setelah semua perubahan selesai
-8. Jika user minta perbaiki bug, HARUS baca file dulu, temukan bug, lalu fix
-9. Jika user minta fitur baru, baca file terkait dulu untuk memahami konteks
+8. Jika user minta perbaiki bug → BACA dulu → temukan bug → fix
+9. Jika user minta fitur baru → baca file terkait → pahami konteks → implementasi
 
 Jika tidak perlu perubahan kode, jawab langsung tanpa tool calls.`;
 
@@ -588,8 +711,8 @@ autonomousRouter.post("/autonomous/chat", async (req: Request, res: Response) =>
 
   send("agent_step", { type: "thinking", label: "Menganalisis permintaan..." });
 
-  // ── Agentic Loop (max 3 rounds) ───────────────────────────────────────────
-  const MAX_ROUNDS = 5;
+  // ── Agentic ReAct Loop (max 6 rounds: Think → Act → Observe → Repeat) ────────
+  const MAX_ROUNDS = 6;
   const conversationMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
     { role: "system", content: AGENT_SYSTEM },
     ...history.slice(-6).map(h => ({ role: h.role as "user" | "assistant", content: h.content })),
@@ -599,19 +722,30 @@ autonomousRouter.post("/autonomous/chat", async (req: Request, res: Response) =>
   const allFilesChanged: Array<{ path: string; ok: boolean; type: "edit" | "write"; error?: string }> = [];
   const allCommandsRun:  Array<{ desc: string; ok: boolean; output: string }> = [];
   let   finalAnswer = "";
-  let   streamingText = "";
+  let   lastStreamedText = "";
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (closed) break;
 
-    send("agent_step", { type: "thinking", label: round === 0 ? "AI sedang berpikir..." : "AI memproses hasil..." });
+    send("agent_step", {
+      type:  "thinking",
+      label: round === 0 ? "AI sedang berpikir..." : `Putaran ${round + 1} — memproses hasil tool...`,
+    });
 
-    streamingText = "";
+    // Create a streaming filter that hides <<<...>>> blocks from live display
+    const streamFilter = makeToolCallFilter();
+    lastStreamedText = "";
+    let   rawResponse = "";
+
     const roundResponse = await callQwenStreaming(
       conversationMessages,
       (text) => {
-        streamingText += text;
-        send("chunk", { text });
+        rawResponse += text;
+        const visible = streamFilter(text);
+        if (visible) {
+          lastStreamedText += visible;
+          send("chunk", { text: visible });
+        }
       },
       "qwen/qwen-2.5-coder-32b-instruct",
       8000,
@@ -629,7 +763,7 @@ autonomousRouter.post("/autonomous/chat", async (req: Request, res: Response) =>
       break;
     }
 
-    // Execute each action and collect results
+    // Execute each action sequentially and collect results
     const toolResults: string[] = [];
 
     for (const action of actions) {
@@ -639,17 +773,23 @@ autonomousRouter.post("/autonomous/chat", async (req: Request, res: Response) =>
         const path = action.params.path;
         send("agent_step", { type: "read", label: `Membaca ${path}` });
         const content = safeReadFile(path);
-        if (content !== null) {
-          toolResults.push(`[FILE: ${path}]\n${content}`);
-        } else {
-          toolResults.push(`[FILE: ${path}] — File tidak ditemukan atau tidak dapat dibaca.`);
-        }
+        toolResults.push(content !== null
+          ? `[FILE: ${path}]\n${content}`
+          : `[FILE: ${path}] — File tidak ditemukan.`);
+        await new Promise(r => setTimeout(r, 50));
+      }
+
+      else if (action.type === "list_dir") {
+        const path = action.params.path;
+        send("agent_step", { type: "search", label: `List ${path}` });
+        const result = listDir(path);
+        toolResults.push(`[LS: ${path}]\n${result}`);
         await new Promise(r => setTimeout(r, 50));
       }
 
       else if (action.type === "search_code") {
         const { pattern, dir } = action.params;
-        send("agent_step", { type: "search", label: `Mencari "${pattern}"${dir ? ` di ${dir}` : ""}` });
+        send("agent_step", { type: "search", label: `Grep "${pattern}"${dir ? ` di ${dir}` : ""}` });
         const result = searchCode(pattern, dir);
         toolResults.push(`[SEARCH: "${pattern}"${dir ? ` in ${dir}` : ""}]\n${result}`);
         await new Promise(r => setTimeout(r, 50));
@@ -657,39 +797,47 @@ autonomousRouter.post("/autonomous/chat", async (req: Request, res: Response) =>
 
       else if (action.type === "list_files") {
         const { pattern } = action.params;
-        send("agent_step", { type: "search", label: `Mencari file ${pattern}` });
+        send("agent_step", { type: "search", label: `Find ${pattern}` });
         const result = listFiles(pattern);
         toolResults.push(`[LIST: "${pattern}"]\n${result}`);
         await new Promise(r => setTimeout(r, 50));
       }
 
+      else if (action.type === "web_search") {
+        const { query } = action.params;
+        send("agent_step", { type: "search", label: `Web: "${query}"` });
+        const result = await searchWeb(query);
+        toolResults.push(`[WEB: "${query}"]\n${result}`);
+        await new Promise(r => setTimeout(r, 100));
+      }
+
       else if (action.type === "edit_file") {
         const { path, old_string, new_string } = action.params;
-        send("agent_step", { type: "edit", label: `Mengedit ${path}` });
+        send("agent_step", { type: "edit", label: `Edit ${path}` });
         const result = applyPreciseEdit(path, old_string, new_string);
         allFilesChanged.push({ path, ok: result.ok, type: "edit", error: result.error });
         send("file_changed", { path, ok: result.ok, type: "edit", error: result.error });
-        toolResults.push(`[EDIT: ${path}] ${result.ok ? "✅ Berhasil" : `❌ Gagal: ${result.error}`}`);
+        toolResults.push(`[EDIT: ${path}] ${result.ok ? "✅ OK" : `❌ Gagal: ${result.error}`}`);
         await new Promise(r => setTimeout(r, 100));
       }
 
       else if (action.type === "write_file") {
         const { path, content } = action.params;
-        send("agent_step", { type: "write", label: `Menulis ${path}` });
+        send("agent_step", { type: "write", label: `Write ${path}` });
         const result = safeWriteFile(path, content);
         allFilesChanged.push({ path, ok: result.ok, type: "write", error: result.error });
         send("file_changed", { path, ok: result.ok, type: "write", error: result.error });
-        toolResults.push(`[WRITE: ${path}] ${result.ok ? "✅ Berhasil" : `❌ Gagal: ${result.error}`}`);
+        toolResults.push(`[WRITE: ${path}] ${result.ok ? "✅ OK" : `❌ Gagal: ${result.error}`}`);
         await new Promise(r => setTimeout(r, 100));
       }
 
       else if (action.type === "run_command") {
         const { cmd, desc } = action.params;
-        send("agent_step", { type: "run", label: desc || cmd });
+        send("agent_step", { type: "run", label: desc || cmd.slice(0, 60) });
         const result = await runSafeCommand(cmd);
         allCommandsRun.push({ desc: desc || cmd, ok: result.ok, output: result.output });
         send("command_result", { desc: desc || cmd, ok: result.ok, output: result.output });
-        toolResults.push(`[RUN: ${desc}]\n${result.ok ? "Exit: 0" : "Exit: 1"}\n${result.output}`);
+        toolResults.push(`[RUN: ${desc}]\nExit: ${result.ok ? 0 : 1}\n${result.output}`);
         await new Promise(r => setTimeout(r, 100));
       }
     }
@@ -697,22 +845,22 @@ autonomousRouter.post("/autonomous/chat", async (req: Request, res: Response) =>
     // Auto-build API after writing/editing API server files
     const editedApiFiles = actions.filter(
       a => (a.type === "edit_file" || a.type === "write_file") &&
-           a.params.path?.includes("artifacts/api-server/src")
+           a.params.path?.includes("artifacts/api-server/src"),
     );
     if (editedApiFiles.length > 0) {
-      send("agent_step", { type: "run", label: "Auto-building API server..." });
+      send("agent_step", { type: "run", label: "Auto-build API server..." });
       const buildResult = await runSafeCommand("pnpm --filter @workspace/api-server run build 2>&1");
       allCommandsRun.push({ desc: "Auto-build API", ok: buildResult.ok, output: buildResult.output });
       send("command_result", { desc: "Auto-build API server", ok: buildResult.ok, output: buildResult.output.slice(0, 800) });
-      toolResults.push(`[AUTO-BUILD API]\n${buildResult.ok ? "✅ Build berhasil" : `❌ Build gagal`}\n${buildResult.output.slice(0, 500)}`);
+      toolResults.push(`[AUTO-BUILD API]\n${buildResult.ok ? "✅ Build berhasil" : "❌ Build gagal"}\n${buildResult.output.slice(0, 500)}`);
     }
 
-    // Feed tool results back to AI for the next round
+    // Feed tool results back to AI for next round
     if (toolResults.length > 0 && round < MAX_ROUNDS - 1) {
       conversationMessages.push({ role: "assistant", content: roundResponse });
       conversationMessages.push({
-        role: "user",
-        content: `Hasil tool calls:\n\n${toolResults.join("\n\n---\n\n")}\n\nLanjutkan. Jika sudah selesai, berikan penjelasan final tanpa tool calls lagi.`,
+        role:    "user",
+        content: `Hasil tool calls:\n\n${toolResults.join("\n\n---\n\n")}\n\nLanjutkan. Jika semua sudah selesai, berikan penjelasan final tanpa tool calls.`,
       });
     } else {
       finalAnswer = stripActionBlocks(roundResponse);
@@ -720,10 +868,11 @@ autonomousRouter.post("/autonomous/chat", async (req: Request, res: Response) =>
     }
   }
 
-  // Clear streaming display and send final response
-  send("response", {
-    content: finalAnswer || (allFilesChanged.length > 0 ? "Selesai menerapkan perubahan." : streamingText),
-  });
+  // Send final clean response
+  const finalContent = finalAnswer.trim() ||
+    (allFilesChanged.length > 0 ? `✅ Selesai — ${allFilesChanged.length} file diperbarui.` : lastStreamedText.trim());
+
+  send("response", { content: finalContent });
   send("done", {
     changes:  allFilesChanged.length,
     files:    allFilesChanged.map(f => ({ path: f.path, ok: f.ok, type: f.type })),

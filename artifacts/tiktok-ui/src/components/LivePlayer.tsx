@@ -313,7 +313,6 @@ export default function LivePlayer({
     });
 
     hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-      setState("playing");
       setMode("hls");
     });
 
@@ -450,8 +449,18 @@ export default function LivePlayer({
       videoEl.pause();
       clearStallTimer();
       clearRetryTimer();
+      destroyAll();
+      try { videoEl.srcObject = null; } catch { /* ignore */ }
+      startedRef.current = false;
+      setZegoActive(false);
+      zegoTriedRef.current = false;
+      hlsTriedRef.current = false;
+      flvTriedRef.current = false;
+      autoRetryCountRef.current = 0;
+      setState("idle");
+      setMode("none");
     }
-  }, [visible, videoEl, clearStallTimer, clearRetryTimer]);
+  }, [visible, videoEl, clearStallTimer, clearRetryTimer, destroyAll]);
 
   useEffect(() => {
     startedRef.current = false;
