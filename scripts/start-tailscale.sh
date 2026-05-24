@@ -5,7 +5,11 @@ mkdir -p /tmp/tailscale-state
 pkill tailscaled 2>/dev/null
 sleep 1
 
-# Start tailscaled in userspace mode dengan outbound proxy SOCKS5 di port 1055
+# Coba aktifkan IP forwarding (mungkin tidak berhasil di Replit, tapi tidak masalah)
+sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
+
+# Start tailscaled dalam userspace mode
 tailscaled \
   --tun=userspace-networking \
   --statedir=/tmp/tailscale-state \
@@ -17,7 +21,7 @@ tailscaled \
 TSPID=$!
 echo "tailscaled started with PID $TSPID"
 
-# Wait for socket to appear
+# Tunggu socket siap
 for i in $(seq 1 15); do
   sleep 1
   if [ -S /tmp/tailscale.sock ]; then
@@ -27,22 +31,30 @@ for i in $(seq 1 15); do
   echo "Waiting for socket... $i"
 done
 
-# Authenticate dan aktifkan accept-routes agar device lain bisa ping server ini
+# Connect + advertise sebagai exit node
 tailscale --socket=/tmp/tailscale.sock up \
   --authkey="$TAILSCALE_AUTH_KEY" \
   --accept-routes \
+  --advertise-exit-node \
   --hostname="scrollap-server" 2>&1
+
+# Pastikan exit node aktif
+tailscale --socket=/tmp/tailscale.sock set --advertise-exit-node 2>&1
 
 echo ""
 echo "=== Tailscale Connected ==="
 tailscale --socket=/tmp/tailscale.sock status 2>&1
 echo ""
 echo "=== Tailscale IP ==="
-tailscale --socket=/tmp/tailscale.sock ip 2>&1
-echo ""
-echo "Akses Scrollap via Tailscale:"
 TS_IP=$(tailscale --socket=/tmp/tailscale.sock ip -4 2>/dev/null)
-echo "  http://${TS_IP}:5000"
+echo "$TS_IP"
+echo ""
+echo "=== Exit Node AKTIF ==="
+echo "Server ini berbagi internet ke HP kamu via Tailscale."
+echo "Cara pakai di HP:"
+echo "  1. Buka Tailscale di HP -> tap 'Exit node'"
+echo "  2. Pilih 'scrollap-server'"
+echo "  3. Internet HP sekarang lewat server ini"
 echo ""
 
 # Keep process alive
