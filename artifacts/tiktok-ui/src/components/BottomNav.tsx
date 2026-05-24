@@ -1,5 +1,5 @@
 import React from "react";
-import { Home, Search, Inbox, User, Plus, Video } from "lucide-react";
+import { Home, Search, Inbox, User, Plus, Video, Tv2 } from "lucide-react";
 
 interface BottomNavProps {
   currentPath: string;
@@ -11,6 +11,7 @@ const tabs = [
   { path: "/discover", icon: Search, label: "Discover" },
   { path: "/create", icon: null, label: "Create" },
   { path: "/favidcall", icon: Video, label: "VidCall" },
+  { path: "/comhub", icon: Tv2, label: "ComHub" },
   { path: "/inbox", icon: Inbox, label: "Inbox" },
   { path: "/profile", icon: User, label: "Profile" },
 ];
