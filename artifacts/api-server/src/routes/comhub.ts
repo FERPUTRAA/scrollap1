@@ -4,10 +4,24 @@ import crypto from "crypto";
 
 const comhubRouter = Router();
 
-const COMHUB_BASE = "https://www.comhub.live";
 export const ZEGO_APP_ID = 2273782735;
 
 const DEVICE_ID = process.env.COMHUB_DEVICE_ID ?? "e937adbe-ab2b-4fa4-23ad-3697aa671165";
+
+/**
+ * Route all ComHub API calls through the Cloudflare Worker proxy to bypass
+ * Replit's IP being geo/rate-blocked by ComHub's servers.
+ * CF Worker accepts: GET/POST https://<worker>/comhub?path=/vchat/app/...
+ */
+const CF_WORKER = (process.env.HOT51_CF_WORKER_URL ?? "").replace(/\/$/, "");
+const USE_CF_PROXY = !!CF_WORKER;
+
+function comhubUrl(path: string): string {
+  if (USE_CF_PROXY) {
+    return `${CF_WORKER}/comhub?path=${encodeURIComponent(path)}`;
+  }
+  return `https://www.comhub.live${path}`;
+}
 
 interface ComHubCreds {
   token:   string;
@@ -68,7 +82,8 @@ function buildHeaders(cred?: ComHubCreds): Record<string, string> {
 }
 
 async function comhubGet(path: string, cred?: ComHubCreds): Promise<unknown> {
-  const res = await undiciFetch(`${COMHUB_BASE}${path}`, {
+  const url = comhubUrl(path);
+  const res = await undiciFetch(url, {
     method: "GET",
     headers: buildHeaders(cred),
     signal: AbortSignal.timeout(12_000),
@@ -80,7 +95,8 @@ async function comhubGet(path: string, cred?: ComHubCreds): Promise<unknown> {
 }
 
 async function comhubPost(path: string, body: Record<string, unknown>, cred?: ComHubCreds): Promise<unknown> {
-  const res = await undiciFetch(`${COMHUB_BASE}${path}`, {
+  const url = comhubUrl(path);
+  const res = await undiciFetch(url, {
     method: "POST",
     headers: buildHeaders(cred),
     body: JSON.stringify(body),
