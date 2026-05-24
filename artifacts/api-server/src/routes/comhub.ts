@@ -25,10 +25,8 @@ function broadcastCHSSE(event: string, data: unknown) {
   for (const fn of sseCHClients) { try { fn(event, data); } catch {} }
 }
 
-function buildHeaders(authToken: string): Record<string, string> {
-  return {
-    "Authorization": `Bearer ${authToken}`,
-    "token": authToken,
+function buildHeaders(authToken?: string): Record<string, string> {
+  const h: Record<string, string> = {
     "Content-Type": "application/json",
     "Accept": "application/json",
     "User-Agent": "ComHub/1.4.51 (Android; Mobile) okhttp/4.9.0",
@@ -36,13 +34,19 @@ function buildHeaders(authToken: string): Record<string, string> {
     "version": "1.4.51",
     "lang": "id",
     "channel": "Google",
+    "country": "ID",
   };
+  if (authToken) {
+    h["Authorization"] = `Bearer ${authToken}`;
+    h["token"] = authToken;
+  }
+  return h;
 }
 
-async function comhubGet(path: string, cred: ComHubCreds): Promise<unknown> {
+async function comhubGet(path: string, cred?: ComHubCreds): Promise<unknown> {
   const res = await undiciFetch(`${COMHUB_BASE}${path}`, {
     method: "GET",
-    headers: buildHeaders(cred.authToken),
+    headers: buildHeaders(cred?.authToken),
     signal: AbortSignal.timeout(12_000),
   });
   const text = await res.text();
@@ -50,18 +54,9 @@ async function comhubGet(path: string, cred: ComHubCreds): Promise<unknown> {
 }
 
 async function comhubPost(path: string, body: Record<string, unknown>, cred?: ComHubCreds): Promise<unknown> {
-  const headers = cred ? buildHeaders(cred.authToken) : {
-    "Content-Type": "application/json",
-    "Accept": "application/json",
-    "User-Agent": "ComHub/1.4.51 (Android; Mobile) okhttp/4.9.0",
-    "platform": "2",
-    "version": "1.4.51",
-    "lang": "id",
-    "channel": "Google",
-  };
   const res = await undiciFetch(`${COMHUB_BASE}${path}`, {
     method: "POST",
-    headers,
+    headers: buildHeaders(cred?.authToken),
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(15_000),
   });
@@ -109,6 +104,7 @@ interface CHLiveRoom {
   tags?: string[];
   countryCode?: string;
   country?: string;
+  area?: string;
 }
 
 interface NormalizedRoom {
@@ -135,13 +131,83 @@ function normalizeRoom(r: CHLiveRoom): NormalizedRoom {
     viewerCount: r.viewerCount ?? r.onlineNum ?? r.online_num ?? r.userCount ?? 0,
     streamId: r.streamId ?? r.stream_id ?? r.pullUrl ?? r.pull_url ?? "",
     title: r.title ?? r.roomTitle ?? r.room_title ?? "",
-    countryCode: r.countryCode ?? r.country ?? "ID",
+    countryCode: r.countryCode ?? r.country ?? r.area ?? "ID",
   };
+}
+
+// Living list cache
+interface LivingCache { rooms: NormalizedRoom[]; ts: number }
+let livingCache: LivingCache | null = null;
+const LIVING_CACHE_TTL = 60_000; // 1 minute
+
+async function fetchLivingRooms(): Promise<{ rooms: NormalizedRoom[]; noAuth: boolean; error?: string }> {
+  // Return cache if fresh
+  if (livingCache && Date.now() - livingCache.ts < LIVING_CACHE_TTL) {
+    return { rooms: livingCache.rooms, noAuth: false };
+  }
+
+  if (!CREDS.valid || !CREDS.authToken) {
+    return { rooms: [], noAuth: true, error: "COMHUB_AUTH_TOKEN belum diset di Replit Secrets" };
+  }
+
+  // Try multiple living list endpoint variants with Indonesia filter
+  const endpoints = [
+    "/api/v1/live/livingList?country=ID&page=1&pageSize=50",
+    "/api/v1/live/livingList?countryCode=ID&page=1&pageSize=50",
+    "/api/v1/live/livingList?area=ID&page=1&pageSize=50",
+    "/api/v1/live/livingList?page=1&pageSize=50",
+  ];
+
+  for (const ep of endpoints) {
+    try {
+      const data = await comhubGet(ep, CREDS) as CHApiResponse<{
+        list?: CHLiveRoom[];
+        records?: CHLiveRoom[];
+        rows?: CHLiveRoom[];
+        total?: number;
+      }>;
+
+      if (data?.code === 401 || data?.code === 403 || data?.status === 401) {
+        CREDS.valid = false;
+        return { rooms: [], noAuth: true, error: "Token ComHub tidak valid atau kedaluwarsa" };
+      }
+
+      if (data?.code !== 200 && data?.status !== 200 && data?.code !== undefined) {
+        continue;
+      }
+
+      const rawList =
+        data?.data?.list ??
+        data?.data?.records ??
+        data?.data?.rows ??
+        (Array.isArray(data?.data) ? (data?.data as CHLiveRoom[]) : []);
+
+      if (rawList.length === 0) continue;
+
+      let rooms = rawList.map(normalizeRoom).filter(r => r.liveId || r.roomId);
+
+      // Filter: Indonesia only (countryCode ID or "id")
+      const idRooms = rooms.filter(r => r.countryCode?.toUpperCase() === "ID");
+      // If Indonesia filter returns results, use those; otherwise fall back to all
+      if (idRooms.length > 0) rooms = idRooms;
+
+      livingCache = { rooms, ts: Date.now() };
+      return { rooms, noAuth: false };
+    } catch {
+      continue;
+    }
+  }
+
+  return { rooms: [], noAuth: false, error: "Tidak ada siaran live Indonesia saat ini" };
 }
 
 // ── GET /comhub/status ────────────────────────────────────────────
 comhubRouter.get("/comhub/status", (_req: Request, res: Response) => {
-  res.json({ authenticated: CREDS.valid && !!CREDS.authToken, userId: CREDS.userId });
+  res.json({
+    authenticated: CREDS.valid && !!CREDS.authToken,
+    userId: CREDS.userId,
+    hasToken: !!CREDS.authToken,
+  });
 });
 
 // ── GET /comhub/credentials ───────────────────────────────────────
@@ -160,6 +226,7 @@ comhubRouter.post("/comhub/credentials", async (req: Request, res: Response) => 
   if (!authToken?.trim()) return res.status(400).json({ success: false, error: "authToken diperlukan" });
 
   CREDS = { authToken: authToken.trim(), userId: userId?.trim() ?? "", valid: true };
+  livingCache = null; // Clear cache when credentials change
 
   try {
     const r = await comhubGet("/api/v1/chatAccount/info", CREDS) as CHApiResponse<{ userId?: number; id?: number; nickname?: string; username?: string }>;
@@ -190,6 +257,7 @@ comhubRouter.post("/comhub/login", async (req: Request, res: Response) => {
     if ((data?.code === 200 || data?.status === 200) && data.data?.token) {
       const uid = data.data.userId ?? data.data.id;
       CREDS = { authToken: data.data.token, userId: String(uid ?? ""), valid: true };
+      livingCache = null;
       broadcastCHSSE("auth_success", { userId: CREDS.userId });
       return res.json({
         success: true, authToken: data.data.token,
@@ -204,36 +272,20 @@ comhubRouter.post("/comhub/login", async (req: Request, res: Response) => {
 });
 
 // ── GET /comhub/living ────────────────────────────────────────────
+// Works without user login — uses COMHUB_AUTH_TOKEN from env secrets
 comhubRouter.get("/comhub/living", async (_req: Request, res: Response) => {
-  if (!CREDS.valid || !CREDS.authToken) {
-    return res.json({ success: false, needAuth: true, error: "auth_required", rooms: [] });
-  }
-
   try {
-    const data = await comhubGet("/api/v1/live/livingList", CREDS) as CHApiResponse<{
-      list?: CHLiveRoom[];
-      records?: CHLiveRoom[];
-      rows?: CHLiveRoom[];
-      total?: number;
-      hasMore?: boolean;
-    }>;
-
-    if (data?.code === 401 || data?.code === 403 || data?.status === 401) {
-      CREDS.valid = false;
-      return res.json({ success: false, needAuth: true, error: "auth_required", rooms: [] });
-    }
-
-    if (data?.code !== 200 && data?.status !== 200 && data?.code !== undefined) {
-      return res.json({ success: false, error: `API ${data.code}: ${data.msg ?? data.message ?? "error"}`, rooms: [], raw: data });
-    }
-
-    const rawList = data?.data?.list ?? data?.data?.records ?? data?.data?.rows ?? (Array.isArray(data?.data) ? (data?.data as CHLiveRoom[]) : []);
-    const rooms = rawList.map(normalizeRoom).filter(r => r.liveId || r.roomId);
-
-    return res.json({ success: true, rooms, total: rooms.length, rawSample: rawList.slice(0, 1) });
+    const { rooms, noAuth, error } = await fetchLivingRooms();
+    return res.json({
+      success: rooms.length > 0 || !noAuth,
+      rooms,
+      total: rooms.length,
+      noAuth,
+      error: rooms.length === 0 ? error : undefined,
+    });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    return res.status(502).json({ success: false, error: msg, rooms: [] });
+    return res.status(502).json({ success: false, error: msg, rooms: [], noAuth: false });
   }
 });
 
