@@ -564,28 +564,34 @@ export default function LivePlayer({
         </div>
       )}
 
+      {/* Mute button — bottom-left, away from top-right nav avatar and right action bar */}
       {state === "playing" && (
-        <div className="absolute top-[65px] right-3 z-20 flex flex-col gap-1.5 items-center">
+        <div className="absolute bottom-[140px] left-3 z-20 flex flex-row gap-1.5 items-center">
           <button
             onClick={() => setMuted((m) => !m)}
-            className="w-8 h-8 rounded-full flex items-center justify-center"
-            style={{ background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)" }}
+            className="w-9 h-9 rounded-full flex items-center justify-center"
+            style={{ background: "rgba(0,0,0,0.6)", backdropFilter: "blur(6px)", border: "1px solid rgba(255,255,255,0.15)" }}
           >
             {muted ? (
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                 <line x1="23" y1="9" x2="17" y2="15" />
                 <line x1="17" y1="9" x2="23" y2="15" />
               </svg>
             ) : (
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2">
                 <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
                 <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07" />
               </svg>
             )}
           </button>
           {modeBadge && (
-            <span className="text-[9px] text-white/60 font-mono">{modeBadge}</span>
+            <span
+              className="text-[9px] font-mono px-1.5 py-0.5 rounded"
+              style={{ background: "rgba(0,0,0,0.55)", color: "rgba(255,255,255,0.55)" }}
+            >
+              {modeBadge}
+            </span>
           )}
         </div>
       )}

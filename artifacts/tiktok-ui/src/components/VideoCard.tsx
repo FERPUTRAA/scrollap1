@@ -79,59 +79,48 @@ export default function VideoCard({ video }: VideoCardProps) {
   const audioSrcRef   = useRef<MediaElementAudioSourceNode | null>(null);
   const gainNodeRef   = useRef<GainNode | null>(null);
   const [videoEl, setVideoEl]         = useState<HTMLVideoElement | null>(null);
-  const [isMuted, setIsMuted]         = useState(true);
 
   const flyLaunchRef = useRef<((gift: GiftItem, fromName?: string) => void) | null>(null);
   const pkTimerRef   = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Keep isMuted in sync with the LivePlayer-controlled video
-  // LivePlayer exposes muted state via onMutedChange; we track it here for recording
-  useEffect(() => {
-    if (!videoEl) return;
-    const check = () => setIsMuted(videoEl.muted);
-    videoEl.addEventListener("volumechange", check);
-    return () => videoEl.removeEventListener("volumechange", check);
-  }, [videoEl]);
-
-  // Setup AudioContext tap — captures audio from the video element regardless of muted state
-  // This ensures recordings always include audio even when the user has video muted
-  const setupAudioCapture = useCallback((el: HTMLVideoElement) => {
-    if (audioCtxRef.current) return; // already set up
-    try {
-      const ctx = new AudioContext();
-      const dest = ctx.createMediaStreamDestination();
-      const gain = ctx.createGain();
-      const src  = ctx.createMediaElementSource(el);
-
-      // Route: source → gain (controls user volume) → speakers
-      src.connect(gain);
-      gain.connect(ctx.destination);
-
-      // Separately tap: source → recording destination (always active, never muted)
-      src.connect(dest);
-
-      audioCtxRef.current  = ctx;
-      audioDestRef.current = dest;
-      audioSrcRef.current  = src;
-      gainNodeRef.current  = gain;
-    } catch (e) {
-      console.warn("AudioContext setup failed:", e);
-    }
-  }, []);
-
   const handleVideoElement = useCallback((el: HTMLVideoElement | null) => {
     setVideoEl(el);
-    if (el) setupAudioCapture(el);
-  }, [setupAudioCapture]);
+  }, []);
 
   useEffect(() => {
     return () => {
-      audioCtxRef.current?.close();
-      audioCtxRef.current  = null;
-      audioDestRef.current = null;
-      audioSrcRef.current  = null;
-      gainNodeRef.current  = null;
+      if (audioCtxRef.current) {
+        audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current  = null;
+        audioDestRef.current = null;
+        audioSrcRef.current  = null;
+        gainNodeRef.current  = null;
+      }
     };
+  }, []);
+
+  // Setup AudioContext tap only when needed (recording start) — not on mount
+  // createMediaElementSource() should NOT be called at mount time as it can break HLS playback
+  const ensureAudioCapture = useCallback((el: HTMLVideoElement): MediaStreamAudioDestinationNode | null => {
+    if (audioDestRef.current) return audioDestRef.current;
+    try {
+      const ctx  = audioCtxRef.current ?? new AudioContext();
+      audioCtxRef.current = ctx;
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      const dest = ctx.createMediaStreamDestination();
+      const gain = ctx.createGain();
+      const src  = ctx.createMediaElementSource(el);
+      src.connect(gain);
+      gain.connect(ctx.destination);
+      src.connect(dest);
+      audioDestRef.current = dest;
+      audioSrcRef.current  = src;
+      gainNodeRef.current  = gain;
+      return dest;
+    } catch (e) {
+      console.warn("AudioContext setup failed:", e);
+      return null;
+    }
   }, []);
 
   // Rotating notices
@@ -248,13 +237,13 @@ export default function VideoCard({ video }: VideoCardProps) {
       // Add video tracks
       videoStream.getVideoTracks().forEach(t => recStream.addTrack(t));
 
-      // Add audio: prefer the AudioContext destination (captures audio regardless of muted state)
-      if (audioDestRef.current) {
-        const audioCtx = audioCtxRef.current;
-        if (audioCtx?.state === "suspended") audioCtx.resume().catch(() => {});
-        audioDestRef.current.stream.getAudioTracks().forEach(t => recStream.addTrack(t));
+      // Add audio: setup AudioContext NOW (at recording start, not on mount)
+      // This ensures audio is captured even when the video element is muted for the user
+      const audioDest = ensureAudioCapture(videoEl);
+      if (audioDest) {
+        audioDest.stream.getAudioTracks().forEach(t => recStream.addTrack(t));
       } else {
-        // Fallback: use audio from captureStream (may or may not work when muted)
+        // Fallback: audio tracks from captureStream directly
         videoStream.getAudioTracks().forEach(t => recStream.addTrack(t));
       }
 
