@@ -119,8 +119,11 @@ export default function Feed() {
       const data: ApiResponse = await res.json();
 
       if (data.success && data.rooms && data.rooms.length > 0) {
-        setVideos(data.rooms.map(mapRoomToVideo));
-        setTotal(data.total ?? data.rooms.length);
+        // Only display rooms that are truly live (have a real stream URL)
+        const liveRooms = data.rooms.filter(r => r.streamUrl && r.streamUrl.length > 10);
+        if (liveRooms.length === 0) throw new Error("Tidak ada host yang sedang live saat ini");
+        setVideos(liveRooms.map(mapRoomToVideo));
+        setTotal(data.total ?? liveRooms.length);
         setStatus("ok");
         setErrorMsg("");
         if (data.rooms[0]) currentAnchorRef.current = data.rooms[0].anchorId ?? data.rooms[0].id;

@@ -564,9 +564,9 @@ export default function LivePlayer({
         </div>
       )}
 
-      {/* Mute button — bottom-left, away from top-right nav avatar and right action bar */}
+      {/* Mute button — center-left, vertically centered on screen */}
       {state === "playing" && (
-        <div className="absolute bottom-[140px] left-3 z-20 flex flex-row gap-1.5 items-center">
+        <div className="absolute top-1/2 -translate-y-1/2 left-3 z-20 flex flex-row gap-1.5 items-center">
           <button
             onClick={() => setMuted((m) => !m)}
             className="w-9 h-9 rounded-full flex items-center justify-center"

@@ -838,12 +838,13 @@ async function fetchLiveRooms(): Promise<{ rooms: ProcessedRoom[]; total: number
     return { rooms: [], total: 0 };
   }
 
+  // Only keep rooms that are confirmed live (have a real stream URL)
+  const allRooms = records.map(mapRoom).filter(r => r.streamUrl && r.streamUrl.length > 10);
   // Sort: rooms with covers first (better UX when scrolling)
-  const allRooms = records.map(mapRoom);
   const withCover = allRooms.filter(r => r.cover);
   const noCover = allRooms.filter(r => !r.cover);
   const rooms = [...withCover, ...noCover];
-  cache = { ts: now, rooms, total: total || rooms.length };
+  cache = { ts: now, rooms, total: rooms.length };
   return cache;
 }
 
