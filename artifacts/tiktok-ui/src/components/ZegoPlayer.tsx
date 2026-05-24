@@ -66,8 +66,8 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   ]);
 }
 
-const MAX_RECONNECT = 5;
-const RECONNECT_DELAY_MS = 3_000;
+const BASE_RECONNECT_DELAY_MS = 2_000;
+const MAX_RECONNECT_DELAY_MS = 30_000;
 
 export function useZegoPlayer({
   roomId,
@@ -89,6 +89,8 @@ export function useZegoPlayer({
   const activeStreamIdRef = useRef<string>("");
   const onPlayingRef = useRef(onPlaying);
   const onErrorRef = useRef(onError);
+  const userIdRef = useRef<string>("");
+  const stalledTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   onPlayingRef.current = onPlaying;
   onErrorRef.current = onError;
 
@@ -100,14 +102,34 @@ export function useZegoPlayer({
 
     if (!videoEl || !zegoStreamId) return;
 
-    const userId = `viewer_${Math.random().toString(36).slice(2, 10)}`;
+    userIdRef.current = `viewer_${Math.random().toString(36).slice(2, 10)}`;
+    const userId = userIdRef.current;
     let engine: ZegoEngine | null = null;
+
+    const clearStalledTimer = () => {
+      if (stalledTimerRef.current) {
+        clearTimeout(stalledTimerRef.current);
+        stalledTimerRef.current = null;
+      }
+    };
+
+    const resetStalledTimer = () => {
+      clearStalledTimer();
+      stalledTimerRef.current = setTimeout(() => {
+        if (!mountedRef.current || !playingRef.current) return;
+        const vid = videoEl;
+        if (vid && !vid.paused && vid.readyState >= 3) return;
+        console.warn("[Zego] Stall detected — scheduling reconnect");
+        playingRef.current = false;
+        scheduleReconnect();
+      }, 15_000);
+    };
 
     const tryPlayStream = async (eng: ZegoEngine, streamId: string): Promise<boolean> => {
       try {
         const stream: MediaStream = await withTimeout(
           eng.startPlayingStream(streamId),
-          5_000
+          8_000
         );
         if (!mountedRef.current) return false;
         videoEl.srcObject = stream;
@@ -116,22 +138,28 @@ export function useZegoPlayer({
         playingRef.current = true;
         connectedOnceRef.current = true;
         activeStreamIdRef.current = streamId;
+        reconnectCountRef.current = 0;
         onPlayingRef.current();
+        resetStalledTimer();
         return true;
       } catch {
         return false;
       }
     };
 
-    const scheduleReconnect = (): void => {
+    function getReconnectDelay(): number {
+      const count = reconnectCountRef.current;
+      const delay = BASE_RECONNECT_DELAY_MS * Math.pow(1.5, Math.min(count, 8));
+      return Math.min(delay, MAX_RECONNECT_DELAY_MS);
+    }
+
+    function scheduleReconnect(): void {
       if (!mountedRef.current) return;
-      if (reconnectCountRef.current >= MAX_RECONNECT) {
-        onErrorRef.current("Koneksi RTC terputus setelah beberapa percobaan");
-        return;
-      }
       reconnectCountRef.current += 1;
-      const delay = RECONNECT_DELAY_MS * reconnectCountRef.current;
-      console.info(`[Zego] Reconnecting in ${delay}ms (attempt ${reconnectCountRef.current}/${MAX_RECONNECT})`);
+      const delay = getReconnectDelay();
+      console.info(`[Zego] Reconnecting in ${delay}ms (attempt ${reconnectCountRef.current})`);
+
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
 
       reconnectTimerRef.current = setTimeout(async () => {
         if (!mountedRef.current || !engine) return;
@@ -145,7 +173,13 @@ export function useZegoPlayer({
         }
 
         try {
-          const newToken = await getZegoToken(userId);
+          const newToken = await withTimeout(getZegoToken(userId), 10_000);
+          if (!mountedRef.current) return;
+
+          try { engine.stopPlayingStream?.(streamId); } catch { /* ignore */ }
+          try { engine.logoutRoom(roomToJoin); } catch { /* ignore */ }
+
+          await new Promise(r => setTimeout(r, 500));
           if (!mountedRef.current) return;
 
           const loginOk = await withTimeout(
@@ -167,13 +201,13 @@ export function useZegoPlayer({
           if (mountedRef.current) scheduleReconnect();
         }
       }, delay);
-    };
+    }
 
     const run = async (): Promise<void> => {
       try {
         const [ZegoExpressEngine, config, token] = await withTimeout(
           Promise.all([loadZegoSDK(), getZegoConfig(), getZegoToken(userId)]),
-          10_000
+          12_000
         );
         if (!mountedRef.current) return;
 
@@ -201,14 +235,25 @@ export function useZegoPlayer({
         ].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i) as string[];
 
         engine.on("roomStreamUpdate", (_rId: unknown, updateType: unknown, streamList: unknown) => {
-          if (!mountedRef.current || updateType !== "ADD" || playingRef.current) return;
+          if (!mountedRef.current || updateType !== "ADD") return;
           const list = streamList as ZegoStream[];
           if (!list?.length) return;
+          if (playingRef.current) return;
           const target = list.find(s => s.streamID === zegoStreamId) ?? list[0];
           if (target) {
             tryPlayStream(engine!, target.streamID).catch(() => {
               if (mountedRef.current) onErrorRef.current("Play failed");
             });
+          }
+        });
+
+        engine.on("roomStreamExtraInfoUpdate", (_rId: unknown, streamList: unknown) => {
+          if (!mountedRef.current || playingRef.current) return;
+          const list = streamList as ZegoStream[];
+          if (!list?.length) return;
+          const target = list.find(s => s.streamID === zegoStreamId) ?? list[0];
+          if (target) {
+            tryPlayStream(engine!, target.streamID).catch(() => {});
           }
         });
 
@@ -228,9 +273,32 @@ export function useZegoPlayer({
             } else if (connectedOnceRef.current && state === "DISCONNECTED") {
               console.warn("[Zego] Room disconnected after playback — scheduling reconnect");
               playingRef.current = false;
+              clearStalledTimer();
               scheduleReconnect();
             }
           }
+        });
+
+        engine.on("playerStateUpdate", (_streamId: unknown, state: unknown, errorCode: unknown) => {
+          console.info("[Zego] playerStateUpdate", { state, errorCode });
+          if (!mountedRef.current) return;
+          if ((state === "PLAY_STOPPED" || state === "NO_PLAY") && errorCode !== 0) {
+            if (connectedOnceRef.current) {
+              console.warn("[Zego] Player stopped unexpectedly — scheduling reconnect");
+              playingRef.current = false;
+              clearStalledTimer();
+              scheduleReconnect();
+            }
+          }
+          if (state === "PLAY_PLAYING") {
+            reconnectCountRef.current = 0;
+            resetStalledTimer();
+          }
+        });
+
+        engine.on("playerVideoSizeChanged", () => {
+          if (!mountedRef.current) return;
+          resetStalledTimer();
         });
 
         let loggedInRoom: string | null = null;
@@ -258,7 +326,12 @@ export function useZegoPlayer({
         loginRoomRef.current = loggedInRoom;
 
         if (!loggedInRoom) {
-          if (mountedRef.current) onErrorRef.current("Tidak dapat terhubung ke server streaming");
+          if (mountedRef.current) {
+            console.warn("[Zego] All rooms failed — will retry in 5s");
+            setTimeout(() => {
+              if (mountedRef.current) scheduleReconnect();
+            }, 5_000);
+          }
           return;
         }
 
@@ -270,12 +343,13 @@ export function useZegoPlayer({
 
         setTimeout(() => {
           if (mountedRef.current && !playingRef.current) {
-            onErrorRef.current("Stream sedang offline atau tidak dapat dijangkau saat ini");
+            console.warn("[Zego] Stream not found in initial candidates — will wait for roomStreamUpdate");
           }
         }, 8_000);
       } catch (e) {
         if (mountedRef.current) {
-          onErrorRef.current(e instanceof Error ? e.message : "Zego error");
+          console.warn("[Zego] Initial connect failed:", e);
+          scheduleReconnect();
         }
       }
     };
@@ -284,6 +358,7 @@ export function useZegoPlayer({
 
     return () => {
       mountedRef.current = false;
+      clearStalledTimer();
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;

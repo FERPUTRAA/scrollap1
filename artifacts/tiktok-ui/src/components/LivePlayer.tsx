@@ -25,6 +25,9 @@ function toAbsoluteUrl(url: string): string {
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 
+const AUTO_RETRY_DELAY_MS = 8_000;
+const STALL_TIMEOUT_MS = 12_000;
+
 export default function LivePlayer({
   streamUrl,
   hlsUrl,
@@ -57,6 +60,18 @@ export default function LivePlayer({
   const zegoTriedRef = useRef(false);
   const hlsTriedRef = useRef(false);
   const flvTriedRef = useRef(false);
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stallTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastProgressRef = useRef<number>(Date.now());
+  const autoRetryCountRef = useRef(0);
+
+  const clearRetryTimer = useCallback(() => {
+    if (retryTimerRef.current) { clearTimeout(retryTimerRef.current); retryTimerRef.current = null; }
+  }, []);
+
+  const clearStallTimer = useCallback(() => {
+    if (stallTimerRef.current) { clearTimeout(stallTimerRef.current); stallTimerRef.current = null; }
+  }, []);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -91,7 +106,64 @@ export default function LivePlayer({
   const destroyAll = useCallback(() => {
     destroyHls();
     destroyFlv();
-  }, [destroyHls, destroyFlv]);
+    clearStallTimer();
+  }, [destroyHls, destroyFlv, clearStallTimer]);
+
+  const doFullRetry = useCallback((el: HTMLVideoElement) => {
+    clearRetryTimer();
+    clearStallTimer();
+    zegoTriedRef.current = false;
+    hlsTriedRef.current = false;
+    flvTriedRef.current = false;
+    setZegoActive(false);
+    startedRef.current = true;
+    setState("loading");
+    setMode("none");
+    setErrorMsg("");
+    destroyAll();
+    try { el.srcObject = null; } catch { /* ignore */ }
+    const rawHls = hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null);
+    if (rawHls) {
+      startHls(toHlsProxyUrl(rawHls), el);
+    } else if (streamUrl) {
+      const absUrl = toAbsoluteUrl(streamUrl);
+      const isCdn = absUrl.includes("cdnsi.com") || absUrl.includes("livcdn.com") || absUrl.includes("baccdn.com");
+      if (isCdn) {
+        const m = absUrl.match(/\/live\/\d+_([^_]+)_/);
+        if (m) {
+          const proxyUrl = `${BASE}/api/stream-proxy?roomId=${m[1]}`;
+          startFlv(toAbsoluteUrl(proxyUrl), el);
+          return;
+        }
+      }
+      startFlv(absUrl, el);
+    } else {
+      tryProxy(el);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hlsUrl, streamUrl, clearRetryTimer, clearStallTimer, destroyAll]);
+
+  const scheduleAutoRetry = useCallback((el: HTMLVideoElement, delaySec?: number) => {
+    clearRetryTimer();
+    autoRetryCountRef.current += 1;
+    const backoff = Math.min((delaySec ?? AUTO_RETRY_DELAY_MS / 1000) * autoRetryCountRef.current, 30);
+    const delay = backoff * 1000;
+    console.info(`[LivePlayer] Auto-retry in ${delay}ms (attempt ${autoRetryCountRef.current})`);
+    retryTimerRef.current = setTimeout(() => {
+      doFullRetry(el);
+    }, delay);
+  }, [clearRetryTimer, doFullRetry]);
+
+  const resetStallTimer = useCallback((el: HTMLVideoElement) => {
+    clearStallTimer();
+    stallTimerRef.current = setTimeout(() => {
+      const now = Date.now();
+      if (now - lastProgressRef.current > STALL_TIMEOUT_MS) {
+        console.warn("[LivePlayer] Stall detected — retrying");
+        scheduleAutoRetry(el, 2);
+      }
+    }, STALL_TIMEOUT_MS + 1_000);
+  }, [clearStallTimer, scheduleAutoRetry]);
 
   const startZego = useCallback(() => {
     if (!zegoStreamId || zegoTriedRef.current) {
@@ -121,10 +193,11 @@ export default function LivePlayer({
         enableWorker: true,
         lazyLoadMaxDuration: 3 * 60,
         liveBufferLatencyChasing: true,
-        liveBufferLatencyMaxLatency: 2.0,
+        liveBufferLatencyMaxLatency: 3.0,
         liveBufferLatencyMinRemain: 0.5,
         autoCleanupSourceBuffer: true,
         fixAudioTimestampGap: true,
+        enableStashBuffer: false,
       }
     );
 
@@ -132,22 +205,53 @@ export default function LivePlayer({
     player.attachMediaElement(el);
     player.load();
 
-    player.on(mpegts.Events.ERROR, () => {
+    player.on(mpegts.Events.ERROR, (_et: unknown, detail: unknown) => {
+      console.warn("[LivePlayer] FLV error:", detail);
       destroyFlv();
-      startZego();
+      scheduleAutoRetry(el, 3);
+    });
+
+    player.on(mpegts.Events.STATISTICS_INFO, (info: { speed?: number }) => {
+      if ((info?.speed ?? 0) > 0) {
+        lastProgressRef.current = Date.now();
+        resetStallTimer(el);
+      }
     });
 
     player.on(mpegts.Events.MEDIA_INFO, () => {
       setState("playing");
       setMode("flv");
+      autoRetryCountRef.current = 0;
+      lastProgressRef.current = Date.now();
+      resetStallTimer(el);
     });
 
+    el.onplaying = () => {
+      setState("playing");
+      setMode("flv");
+      autoRetryCountRef.current = 0;
+      lastProgressRef.current = Date.now();
+      resetStallTimer(el);
+    };
+
+    el.onstalled = () => {
+      console.warn("[LivePlayer] FLV stalled");
+      scheduleAutoRetry(el, 3);
+    };
+
+    el.onwaiting = () => {
+      if (Date.now() - lastProgressRef.current > 8_000) {
+        console.warn("[LivePlayer] FLV waiting too long");
+        scheduleAutoRetry(el, 3);
+      }
+    };
+
     el.play().catch(() => {});
-  }, [destroyAll, destroyFlv, startZego]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [destroyAll, destroyFlv, startZego, scheduleAutoRetry, resetStallTimer]);
 
   const startHls = useCallback((url: string, el: HTMLVideoElement) => {
     if (hlsTriedRef.current) {
-      // Already tried HLS, fall back to FLV
       startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
       return;
     }
@@ -158,29 +262,41 @@ export default function LivePlayer({
     setMode("hls");
     hlsTriedRef.current = true;
 
-    // Native HLS (Safari)
     if (!Hls.isSupported() && el.canPlayType("application/vnd.apple.mpegurl")) {
       el.src = url;
       el.play().catch(() => {});
-      el.onloadeddata = () => { setState("playing"); setMode("hls"); };
+      el.onloadeddata = () => {
+        setState("playing");
+        setMode("hls");
+        autoRetryCountRef.current = 0;
+        lastProgressRef.current = Date.now();
+        resetStallTimer(el);
+      };
       el.onerror = () => {
         startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
       };
+      el.onstalled = () => scheduleAutoRetry(el, 3);
       return;
     }
 
     if (!Hls.isSupported()) {
-      // HLS not supported — go straight to FLV
       startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : "", el);
       return;
     }
 
     const hls = new Hls({
-      liveSyncDurationCount: 3,
+      liveSyncDurationCount: 2,
       liveMaxLatencyDurationCount: 5,
-      maxBufferLength: 10,
-      maxMaxBufferLength: 30,
+      maxBufferLength: 8,
+      maxMaxBufferLength: 20,
       enableWorker: true,
+      fragLoadingMaxRetry: 6,
+      fragLoadingRetryDelay: 1000,
+      manifestLoadingMaxRetry: 4,
+      manifestLoadingRetryDelay: 1000,
+      levelLoadingMaxRetry: 4,
+      liveBackBufferLength: 0,
+      xhrSetup: undefined,
     });
     hlsRef.current = hls;
 
@@ -191,6 +307,11 @@ export default function LivePlayer({
       el.play().catch(() => {});
     });
 
+    hls.on(Hls.Events.FRAG_LOADED, () => {
+      lastProgressRef.current = Date.now();
+      resetStallTimer(el);
+    });
+
     hls.on(Hls.Events.MEDIA_ATTACHED, () => {
       setState("playing");
       setMode("hls");
@@ -198,14 +319,40 @@ export default function LivePlayer({
 
     hls.on(Hls.Events.ERROR, (_event, data) => {
       if (data.fatal) {
+        console.warn("[LivePlayer] HLS fatal error:", data.type, data.details);
         destroyHls();
-        // HLS failed → try FLV
-        startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          scheduleAutoRetry(el, 3);
+        } else {
+          startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
+        }
+      } else {
+        if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
+            data.details === Hls.ErrorDetails.BUFFER_NUDGE_ON_STALL) {
+          console.warn("[LivePlayer] HLS buffer stall, nudging");
+          try { el.currentTime += 0.1; } catch { /* ignore */ }
+        }
       }
     });
 
-    el.onplaying = () => { setState("playing"); setMode("hls"); };
-  }, [hlsTriedRef, destroyAll, destroyHls, startFlv, streamUrl]);
+    el.onplaying = () => {
+      setState("playing");
+      setMode("hls");
+      autoRetryCountRef.current = 0;
+      lastProgressRef.current = Date.now();
+      resetStallTimer(el);
+    };
+
+    el.ontimeupdate = () => {
+      lastProgressRef.current = Date.now();
+    };
+
+    el.onstalled = () => {
+      console.warn("[LivePlayer] HLS stalled");
+      scheduleAutoRetry(el, 4);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hlsTriedRef, destroyAll, destroyHls, startFlv, streamUrl, scheduleAutoRetry, resetStallTimer]);
 
   const tryProxy = useCallback(async (el: HTMLVideoElement) => {
     setState("loading");
@@ -232,27 +379,22 @@ export default function LivePlayer({
     }
   }, [roomId, anchorId, liveId, startFlv, startZego]);
 
-  /** Wrap a Hot51 CDN URL through our server-side HLS proxy to bypass geo-blocking */
   function toHlsProxyUrl(url: string): string {
     const abs = toAbsoluteUrl(url);
-    // Only wrap CDN URLs that would be geo-blocked; already-proxied URLs pass through
     if (abs.includes("/api/hls-proxy") || abs.includes("/api/ts-proxy")) return abs;
     const isHot51Cdn = abs.includes("cdnsi.com") || abs.includes("livcdn.com") || abs.includes("baccdn.com");
     if (isHot51Cdn) return `${BASE}/api/hls-proxy?url=${encodeURIComponent(abs)}`;
     return abs;
   }
 
-  /** Entry point: try HLS (via proxy) → FLV (via proxy) → Zego */
   const startCdn = useCallback((el: HTMLVideoElement) => {
     const rawHls = hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null);
     if (rawHls) {
       startHls(toHlsProxyUrl(rawHls), el);
     } else if (streamUrl) {
-      // FLV — route through stream-proxy endpoint so it goes via proxy pool
       const absUrl = toAbsoluteUrl(streamUrl);
       const isCdn = absUrl.includes("cdnsi.com") || absUrl.includes("livcdn.com") || absUrl.includes("baccdn.com");
       if (isCdn) {
-        // Extract roomId from CDN URL pattern: /live/501_<roomId>_<key>.flv
         const m = absUrl.match(/\/live\/\d+_([^_]+)_/);
         if (m) {
           const proxyUrl = `${BASE}/api/stream-proxy?roomId=${m[1]}`;
@@ -270,12 +412,17 @@ export default function LivePlayer({
   const handleZegoPlaying = useCallback(() => {
     setMode("zego");
     setState("playing");
+    autoRetryCountRef.current = 0;
   }, []);
 
   const handleZegoError = useCallback((_msg: string) => {
     setZegoActive(false);
-    setState("blocked");
-  }, []);
+    if (videoEl) {
+      scheduleAutoRetry(videoEl, 5);
+    } else {
+      setState("blocked");
+    }
+  }, [videoEl, scheduleAutoRetry]);
 
   useZegoPlayer({
     roomId,
@@ -291,6 +438,7 @@ export default function LivePlayer({
   useEffect(() => {
     if (!visible || !videoEl || startedRef.current) return;
     startedRef.current = true;
+    autoRetryCountRef.current = 0;
     startCdn(videoEl);
   }, [visible, videoEl, startCdn]);
 
@@ -300,36 +448,50 @@ export default function LivePlayer({
       videoEl.play().catch(() => {});
     } else {
       videoEl.pause();
+      clearStallTimer();
+      clearRetryTimer();
     }
-  }, [visible, videoEl]);
+  }, [visible, videoEl, clearStallTimer, clearRetryTimer]);
 
   useEffect(() => {
     startedRef.current = false;
     zegoTriedRef.current = false;
     hlsTriedRef.current = false;
     flvTriedRef.current = false;
+    autoRetryCountRef.current = 0;
     setZegoActive(false);
     setState("idle");
     setMode("none");
+    setErrorMsg("");
+    clearRetryTimer();
+    clearStallTimer();
     abortRef.current?.abort();
     destroyAll();
     if (videoEl) try { videoEl.srcObject = null; } catch { /* ignore */ }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
   useEffect(() => {
     return () => {
+      clearRetryTimer();
+      clearStallTimer();
       abortRef.current?.abort();
       destroyAll();
     };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   function handleRetry() {
+    autoRetryCountRef.current = 0;
+    clearRetryTimer();
+    clearStallTimer();
     zegoTriedRef.current = false;
     hlsTriedRef.current = false;
     flvTriedRef.current = false;
     setZegoActive(false);
     startedRef.current = false;
     setState("idle");
+    setErrorMsg("");
     destroyAll();
     if (videoEl) {
       try { videoEl.srcObject = null; } catch { /* ignore */ }
@@ -383,14 +545,14 @@ export default function LivePlayer({
             </svg>
           </div>
           <p className="text-white/70 text-[12px] text-center font-semibold">
-            {state === "error" ? "Gagal memuat stream" : "Stream tidak tersedia"}
+            {state === "error" ? "Gagal memuat stream" : "Mencoba koneksi ulang…"}
           </p>
           <p className="text-white/40 text-[10px] text-center leading-relaxed max-w-[220px]">
             {errorMsg
               ? errorMsg
               : state === "error"
               ? "Koneksi terputus. Periksa jaringan dan coba lagi."
-              : "Stream sedang offline atau tidak dapat dijangkau saat ini."}
+              : "Stream sedang mencoba kembali terhubung…"}
           </p>
           <button
             onClick={handleRetry}
