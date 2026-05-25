@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { promisify } from "util";
 import { fetch as undiciFetch, ProxyAgent } from "undici";
 import crypto from "crypto";
@@ -100,7 +100,7 @@ async function refreshProxyPool(): Promise<void> {
     const fetched = text
       .split(/\r?\n/)
       .map(l => l.trim())
-      .filter(l => /^(socks5?|http):\/\//i.test(l));
+      .filter(l => /^(socks[1-5]?|http):\/\//i.test(l));
     if (fetched.length > 0) {
       // Put SOCKS5 first, then HTTP; deduplicate
       const socks = fetched.filter(p => /^socks/i.test(p));
@@ -1526,6 +1526,159 @@ liveRouter.get("/stream-proxy", async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * Curl-based CDN text fetch (HLS manifests).
+ * Works with SOCKS4, SOCKS5, and HTTP proxies (unlike undici which skips SOCKS4).
+ * Returns the response body string, or null on failure.
+ */
+async function curlFetchCdnText(
+  url: string,
+  headers: Record<string, string>,
+  proxyUrl: string,
+  timeoutMs = 12_000,
+): Promise<string | null> {
+  const proxyArgs = proxyFlagFor(proxyUrl);
+  const headerArgs = Object.entries(headers).flatMap(([k, v]) => ["-H", `${k}: ${v}`]);
+  const sentinel = "__CURL_STATUS__";
+  const args = [
+    "-s", "--compressed",
+    "--max-time", String(Math.ceil(timeoutMs / 1000)),
+    "--connect-timeout", "8",
+    "-w", `\n${sentinel}%{http_code}`,
+    ...proxyArgs,
+    ...headerArgs,
+    url,
+  ];
+  try {
+    const { stdout } = await execFileAsync("curl", args, {
+      timeout: timeoutMs + 4_000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    const idx = stdout.lastIndexOf(`\n${sentinel}`);
+    if (idx === -1) return null;
+    const status = stdout.slice(idx + sentinel.length + 1).trim();
+    if (status !== "200") return null;
+    return stdout.slice(0, idx);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Race proxies in parallel batches using curl to fetch an HLS manifest.
+ * Returns the first successful response body, or null if all fail.
+ */
+async function curlRaceCdnText(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs = 20_000,
+): Promise<string | null> {
+  const perAttempt = Math.min(10_000, Math.floor(timeoutMs * 0.55));
+  const BATCH = 6;
+  const proxies = getLiveProxies();
+
+  // STEP 0: Try CF Worker first (fastest for CDN if it works)
+  if (CF_WORKER_URL) {
+    const cfUrl = wrapWithCfWorker(url);
+    try {
+      const r = await undiciFetch(cfUrl, {
+        headers: { "User-Agent": "Lavf/61.1.100", Accept: "*/*", "Accept-Encoding": "identity" },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (r.ok) {
+        const body = await r.text();
+        if (body.includes("#EXTM3U")) return body;
+        r.body?.cancel().catch(() => {});
+      } else {
+        r.body?.cancel().catch(() => {});
+      }
+    } catch { /* fall through */ }
+  }
+
+  // STEP 1: Race proxy batches using curl (SOCKS4 + SOCKS5 + HTTP)
+  for (let i = 0; i < Math.min(proxies.length, 30); i += BATCH) {
+    const batch = proxies.slice(i, i + BATCH);
+    const result = await Promise.any(
+      batch.map(async (proxyUrl) => {
+        const body = await curlFetchCdnText(url, headers, proxyUrl, perAttempt);
+        if (body && body.includes("#EXTM3U")) return { body, proxy: proxyUrl };
+        throw new Error("fail");
+      })
+    ).catch(() => null);
+
+    if (result) {
+      setCachedCdnProxy(new URL(url).hostname, result.proxy);
+      return result.body;
+    }
+  }
+
+  // STEP 2: Final direct attempt
+  try {
+    const r = await undiciFetch(url, {
+      headers,
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (r.ok) {
+      const body = await r.text();
+      if (body.includes("#EXTM3U")) return body;
+    }
+  } catch { /* ignore */ }
+
+  return null;
+}
+
+/**
+ * Spawn curl to stream a CDN TS segment through a proxy directly to the HTTP response.
+ * Handles SOCKS4, SOCKS5, HTTP proxies.
+ */
+function spawnCurlStream(
+  url: string,
+  headers: Record<string, string>,
+  proxyUrl: string,
+  timeoutMs: number,
+  res: Response,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const proxyArgs = proxyFlagFor(proxyUrl);
+    const headerArgs = Object.entries(headers).flatMap(([k, v]) => ["-H", `${k}: ${v}`]);
+    const args = [
+      "-s", "--compressed",
+      "--max-time", String(Math.ceil(timeoutMs / 1000)),
+      "--connect-timeout", "7",
+      ...proxyArgs,
+      ...headerArgs,
+      url,
+    ];
+    const child = spawn("curl", args);
+    let started = false;
+    let wrote = false;
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (!wrote) {
+        wrote = true;
+        started = true;
+        if (!res.headersSent) {
+          res.setHeader("Access-Control-Allow-Origin", "*");
+          res.setHeader("Content-Type", "video/MP2T");
+          res.setHeader("Cache-Control", "no-store");
+          res.setHeader("X-Proxy-Mode", proxyUrl.split("://")[0]);
+        }
+      }
+      if (!res.writableEnded) res.write(chunk);
+    });
+
+    child.on("close", (code) => {
+      if (started && !res.writableEnded) res.end();
+      resolve(started && code === 0);
+    });
+
+    child.on("error", () => resolve(false));
+
+    // Cleanup if client disconnects
+    res.on("close", () => { try { child.kill(); } catch { /* ignore */ } });
+  });
+}
+
 /** GET /api/hls-proxy?url=<encoded_m3u8_url>
  * Fetches an HLS manifest through the proxy pool and rewrites segment URLs
  * to go through /api/ts-proxy so the browser never touches the CDN directly.
@@ -1547,100 +1700,56 @@ liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
 
   req.log.info({ url: rawUrl }, "hls-proxy start");
 
-  // Build ordered list of URLs to try: CF worker first (most reliable), then proxy pool fallbacks
   const isCdnUrl = rawUrl.includes("cdnsi.com") || rawUrl.includes("livcdn.com") || rawUrl.includes("baccdn.com");
-  const cfWrapped = CF_WORKER_URL && isCdnUrl ? wrapWithCfWorker(rawUrl) : null;
-  const urlsToTry = [rawUrl, ...buildCdnFallbackUrls(rawUrl)];
 
-  try {
-    let result: { res: Awaited<ReturnType<typeof undiciFetch>>; proxy: string | null } | null = null;
-    let usedUrl = rawUrl;
+  // Try all CDN URLs (primary + fallback domains) via curl-based racing
+  const urlsToTry = isCdnUrl ? [rawUrl, ...buildCdnFallbackUrls(rawUrl)] : [rawUrl];
 
-    // STEP 0: Try CF worker first — fastest and most reliable for CDN URLs
-    if (cfWrapped) {
-      try {
-        const r = await undiciFetch(cfWrapped, { headers: cdnHeaders, signal: AbortSignal.timeout(8_000) });
-        if (r.ok) { result = { res: r, proxy: "cf-worker" }; usedUrl = rawUrl; }
-        else r.body?.cancel().catch(() => {});
-      } catch { /* fall through to proxy pool */ }
-    }
+  let manifestText: string | null = null;
+  let usedUrl = rawUrl;
 
-    for (const candidateUrl of urlsToTry) {
-      if (result) break;
-      result = await fetchViaBestProxy(candidateUrl, cdnHeaders, 14_000);
-      if (result?.res.ok) { usedUrl = candidateUrl; break; }
-      // Non-ok but got response — log and try next CDN domain
-      if (result?.res) {
-        req.log.warn({ url: candidateUrl, status: result.res.status }, "hls-proxy: CDN rejected, trying fallback domain");
-        // Drain body to avoid leaks
-        result.res.body?.cancel().catch(() => {});
-        result = null;
-      }
-    }
-
-    if (!result || !result.res.body) {
-      req.log.warn({ url: rawUrl }, "hls-proxy: all proxies and CDN domains failed");
-      res.status(502).json({
-        error: "HLS manifest tidak bisa diambil — semua proxy gagal",
-        url: rawUrl,
-        hint: "CDN mungkin memblokir semua proxy. Coba set HOT51_CF_WORKER_URL.",
-      });
-      return;
-    }
-
-    const status = result.res.status;
-    req.log.info({ url: usedUrl, status, proxy: result.proxy }, "hls-proxy: got CDN response");
-
-    if (!result.res.ok) {
-      res.status(502).json({
-        error: `CDN menolak permintaan: HTTP ${status}`,
-        url: usedUrl,
-        proxy: result.proxy,
-        hint: status === 403
-          ? "Stream mungkin terkunci atau STREAM_KEY salah"
-          : status === 404
-            ? "Stream tidak ditemukan — anchor mungkin sudah offline"
-            : `CDN error ${status}`,
-      });
-      return;
-    }
-
-    const text = await result.res.text();
-    const baseUrl = rawUrl.substring(0, rawUrl.lastIndexOf("/") + 1);
-
-    // Rewrite each line: absolute URLs and relative paths pointing to TS segments or sub-manifests
-    const rewritten = text.split("\n").map(line => {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) return line;
-      // Resolve relative segment URLs to absolute, then wrap in ts-proxy
-      let absUrl: string;
-      if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
-        absUrl = trimmed;
-      } else {
-        absUrl = baseUrl + trimmed;
-      }
-      // Sub-manifests (.m3u8) → route through hls-proxy, segments (.ts) → ts-proxy or CF worker
-      if (absUrl.includes(".m3u8")) {
-        return `/api/hls-proxy?url=${encodeURIComponent(absUrl)}`;
-      }
-      // For CDN TS segments: if CF worker is available, embed the CF worker URL directly
-      // so the browser fetches segments straight from Cloudflare edge — no server roundtrip needed
-      const isCdnSeg = absUrl.includes("cdnsi.com") || absUrl.includes("livcdn.com") || absUrl.includes("baccdn.com");
-      if (CF_WORKER_URL && isCdnSeg) {
-        return `${CF_WORKER_URL}/?url=${encodeURIComponent(absUrl)}`;
-      }
-      return `/api/ts-proxy?url=${encodeURIComponent(absUrl)}`;
-    }).join("\n");
-
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("X-Proxy-Mode", result.proxy ?? "direct");
-    res.send(rewritten);
-  } catch (err) {
-    req.log.error({ url: rawUrl, err }, "hls-proxy: exception");
-    res.status(502).json({ error: String(err) });
+  for (const candidateUrl of urlsToTry) {
+    try {
+      const body = await curlRaceCdnText(candidateUrl, cdnHeaders, 25_000);
+      if (body) { manifestText = body; usedUrl = candidateUrl; break; }
+    } catch { /* try next */ }
   }
+
+  if (!manifestText) {
+    req.log.warn({ url: rawUrl }, "hls-proxy: all proxies and CDN domains failed");
+    res.status(502).json({
+      error: "HLS manifest tidak bisa diambil — semua proxy gagal",
+      url: rawUrl,
+      hint: "Pastikan proxy Indonesia aktif. Cek /api/proxy-status.",
+    });
+    return;
+  }
+
+  req.log.info({ url: usedUrl }, "hls-proxy: got manifest");
+
+  // Rewrite each line: absolute URLs and relative paths → ts-proxy
+  const baseUrl = usedUrl.substring(0, usedUrl.lastIndexOf("/") + 1);
+  const rewritten = manifestText.split("\n").map(line => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) return line;
+    let absUrl: string;
+    if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) {
+      absUrl = trimmed;
+    } else {
+      absUrl = baseUrl + trimmed;
+    }
+    // Sub-manifests → hls-proxy recursively
+    if (absUrl.includes(".m3u8")) {
+      return `/api/hls-proxy?url=${encodeURIComponent(absUrl)}`;
+    }
+    // TS segments → always route through ts-proxy (curl-based, SOCKS4 support)
+    return `/api/ts-proxy?url=${encodeURIComponent(absUrl)}`;
+  }).join("\n");
+
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
+  res.setHeader("Cache-Control", "no-store");
+  res.send(rewritten);
 });
 
 /** GET /api/ts-proxy?url=<encoded_segment_url>
@@ -1653,61 +1762,56 @@ liveRouter.get("/ts-proxy", async (req: Request, res: Response) => {
     return;
   }
 
-  const cdnHeaders = {
+  const cdnHeaders: Record<string, string> = {
     "User-Agent": "Lavf/61.1.100",
     Accept: "*/*",
     "Accept-Encoding": "identity",
     Referer: "https://hot51.com",
     Origin: "https://hot51.com",
-    Range: String(req.headers["range"] ?? "bytes=0-"),
   };
+  if (req.headers["range"]) cdnHeaders["Range"] = String(req.headers["range"]);
 
-  try {
-    const isTsCdn = rawUrl.includes("cdnsi.com") || rawUrl.includes("livcdn.com") || rawUrl.includes("baccdn.com");
-    const cfTs = CF_WORKER_URL && isTsCdn ? wrapWithCfWorker(rawUrl) : null;
+  const proxies = getLiveProxies();
+  const PER_ATTEMPT = 10_000;
+  const BATCH = 5;
 
-    let result: { res: Awaited<ReturnType<typeof undiciFetch>>; proxy: string | null } | null = null;
+  // Race proxy batches — first successful curl stream wins
+  for (let i = 0; i < Math.min(proxies.length, 30); i += BATCH) {
+    const batch = proxies.slice(i, i + BATCH);
+    // Try each proxy in parallel — first to stream data wins
+    const won = await Promise.any(
+      batch.map(proxyUrl =>
+        spawnCurlStream(rawUrl, cdnHeaders, proxyUrl, PER_ATTEMPT, res)
+          .then(ok => { if (!ok) throw new Error("no data"); return true; })
+      )
+    ).catch(() => false);
 
-    // Try CF worker first for CDN segments — fastest path
-    if (cfTs) {
-      try {
-        const r = await undiciFetch(cfTs, { headers: cdnHeaders, signal: AbortSignal.timeout(8_000) });
-        if (r.ok) result = { res: r, proxy: "cf-worker" };
-        else r.body?.cancel().catch(() => {});
-      } catch { /* fall through */ }
-    }
-
-    if (!result) result = await fetchViaBestProxy(rawUrl, cdnHeaders, 15_000);
-
-    if (!result || !result.res.body) {
-      res.status(502).send("");
-      return;
-    }
-
-    if (!result.res.ok) {
-      res.status(result.res.status).send(`CDN returned ${result.res.status}`);
-      return;
-    }
-
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Content-Type", result.res.headers.get("content-type") ?? "video/MP2T");
-    res.setHeader("Cache-Control", "no-store");
-    res.setHeader("X-Proxy-Mode", result.proxy ?? "direct");
-    const contentLength = result.res.headers.get("content-length");
-    if (contentLength) res.setHeader("Content-Length", contentLength);
-
-    const reader = result.res.body.getReader();
-    req.on("close", () => reader.cancel().catch(() => {}));
-    const pump = async (): Promise<void> => {
-      const { done, value } = await reader.read();
-      if (done) { res.end(); return; }
-      if (!res.writableEnded) res.write(value);
-      return pump();
-    };
-    await pump();
-  } catch (err) {
-    if (!res.headersSent) res.status(502).send(String(err));
+    if (won) return;
+    if (res.headersSent) return; // another proxy already won
   }
+
+  // Final direct attempt
+  try {
+    const r = await undiciFetch(rawUrl, { headers: cdnHeaders, signal: AbortSignal.timeout(8_000) });
+    if (r.ok && r.body) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Content-Type", r.headers.get("content-type") ?? "video/MP2T");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Proxy-Mode", "direct");
+      const reader = r.body.getReader();
+      req.on("close", () => reader.cancel().catch(() => {}));
+      const pump = async (): Promise<void> => {
+        const { done, value } = await reader.read();
+        if (done) { res.end(); return; }
+        if (!res.writableEnded) res.write(value);
+        return pump();
+      };
+      await pump();
+      return;
+    }
+  } catch { /* ignore */ }
+
+  if (!res.headersSent) res.status(502).send("");
 });
 
 /**
