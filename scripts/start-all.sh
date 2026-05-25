@@ -34,6 +34,14 @@ TAILSCALE=/nix/store/xdqdr208nmr26a0wpbm7p9qb5db3s5xb-tailscale-1.82.5/bin/tails
   fi
 ) &
 
+# ── Frontend (Vite) — background on port 5000 ────────────────────────────────
+echo "[ui] Starting frontend on port 5000..."
+(
+  export PORT=5000
+  export BASE_PATH=/
+  exec pnpm run --filter @workspace/tiktok-ui dev
+) &
+
 # ── API Server — foreground (keeps workflow alive, port 8080) ─────────────────
 echo "[api] Starting on port 8080..."
 export PORT=8080
