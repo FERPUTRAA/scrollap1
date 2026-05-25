@@ -183,6 +183,8 @@ export default function Feed() {
   useEffect(() => {
     checkSession();
     fetchRooms();
+    // Refresh every 20s — Hot51 CDN tokens expire in ~29s so we must rotate
+    // hlsUrl / streamUrl before the token goes stale.
     const iv = setInterval(async () => {
       try {
         const res = await fetch(`${BASE}/api/live-rooms?limit=30`);
@@ -195,7 +197,14 @@ export default function Feed() {
             const merged = prev.map(v => {
               const updated = data.rooms!.find(r => r.id === v.id || r.anchorId === v.anchorId);
               if (!updated) return v;
-              return { ...v, viewers: updated.viewers, likes: formatCount(updated.viewers) };
+              // Always refresh stream URLs so HLS.js retries use a valid token
+              return {
+                ...v,
+                viewers: updated.viewers,
+                likes: formatCount(updated.viewers),
+                streamUrl: updated.streamUrl ?? v.streamUrl,
+                hlsUrl: updated.hlsUrl ?? v.hlsUrl,
+              };
             });
             const newRooms = data.rooms!
               .filter(r => !existingIds.has(r.id))
@@ -204,7 +213,7 @@ export default function Feed() {
           });
         }
       } catch { }
-    }, 120_000);
+    }, 20_000);
     return () => clearInterval(iv);
   }, [fetchRooms, checkSession]);
 

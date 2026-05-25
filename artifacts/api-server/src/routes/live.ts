@@ -1690,13 +1690,31 @@ function spawnCurlStream(
 }
 
 /** GET /api/hls-proxy?url=<encoded_m3u8_url>
+ *   OR  /api/hls-proxy?room=<anchorId>  ← always fetches a fresh token from Hot51
+ *
  * Fetches an HLS manifest through the proxy pool and rewrites segment URLs
  * to go through /api/ts-proxy so the browser never touches the CDN directly.
+ *
+ * The ?room= form is preferred: it bypasses the 2-minute live-rooms cache and
+ * calls the Hot51 room-info API directly so the CDN token is always fresh
+ * (tokens expire in ~29 seconds, the cache would serve stale URLs otherwise).
  */
 liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
-  const rawUrl = String(req.query.url ?? "");
+  let rawUrl = String(req.query.url ?? "");
+
+  // ?room={anchorId} — fetch a fresh stream URL, ignoring the rooms cache
+  const roomParam = String(req.query.room ?? "");
+  if (roomParam && !rawUrl) {
+    const freshUrl = await getRealStreamUrl(roomParam, roomParam).catch(() => null);
+    if (!freshUrl) {
+      res.status(502).json({ error: "Could not obtain fresh stream URL for room", room: roomParam });
+      return;
+    }
+    rawUrl = freshUrl;
+  }
+
   if (!rawUrl || !rawUrl.startsWith("http")) {
-    res.status(400).json({ error: "Missing or invalid ?url" });
+    res.status(400).json({ error: "Missing or invalid ?url or ?room" });
     return;
   }
 
@@ -1793,10 +1811,35 @@ liveRouter.get("/ts-proxy", async (req: Request, res: Response) => {
   const PER_ATTEMPT = 10_000;
   const BATCH = 5;
 
-  // Race proxy batches — first successful curl stream wins
+  // STEP 0: Try direct fetch first (fast when CDN is not geo-blocked from this host).
+  // This is the common case in the Replit environment — saves 10-50s of proxy waiting.
+  try {
+    const r = await undiciFetch(rawUrl, { headers: cdnHeaders, signal: AbortSignal.timeout(4_000) });
+    if (r.ok && r.body) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Content-Type", r.headers.get("content-type") ?? "video/MP2T");
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("X-Proxy-Mode", "direct");
+      const reader = r.body.getReader();
+      req.on("close", () => reader.cancel().catch(() => {}));
+      const pump = async (): Promise<void> => {
+        const { done, value } = await reader.read();
+        if (done) { res.end(); return; }
+        if (!res.writableEnded) res.write(value);
+        return pump();
+      };
+      await pump();
+      return;
+    }
+    r.body?.cancel().catch(() => {});
+  } catch { /* geo-blocked or timeout — fall through to proxy pool */ }
+
+  if (res.headersSent) return;
+
+  // STEP 1: Race proxy batches — first successful curl stream wins
+  // (only reached if direct fetch was blocked or failed)
   for (let i = 0; i < Math.min(proxies.length, 30); i += BATCH) {
     const batch = proxies.slice(i, i + BATCH);
-    // Try each proxy in parallel — first to stream data wins
     const won = await Promise.any(
       batch.map(proxyUrl =>
         spawnCurlStream(rawUrl, cdnHeaders, proxyUrl, PER_ATTEMPT, res)
@@ -1805,17 +1848,17 @@ liveRouter.get("/ts-proxy", async (req: Request, res: Response) => {
     ).catch(() => false);
 
     if (won) return;
-    if (res.headersSent) return; // another proxy already won
+    if (res.headersSent) return;
   }
 
-  // Final direct attempt
+  // STEP 2: Final direct attempt with longer timeout
   try {
     const r = await undiciFetch(rawUrl, { headers: cdnHeaders, signal: AbortSignal.timeout(8_000) });
     if (r.ok && r.body) {
       res.setHeader("Access-Control-Allow-Origin", "*");
       res.setHeader("Content-Type", r.headers.get("content-type") ?? "video/MP2T");
       res.setHeader("Cache-Control", "no-store");
-      res.setHeader("X-Proxy-Mode", "direct");
+      res.setHeader("X-Proxy-Mode", "direct-fallback");
       const reader = r.body.getReader();
       req.on("close", () => reader.cancel().catch(() => {}));
       const pump = async (): Promise<void> => {

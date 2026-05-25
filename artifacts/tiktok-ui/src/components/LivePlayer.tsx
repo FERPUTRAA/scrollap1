@@ -382,7 +382,12 @@ export default function LivePlayer({
     const abs = toAbsoluteUrl(url);
     if (abs.includes("/api/hls-proxy") || abs.includes("/api/ts-proxy")) return abs;
     const isHot51Cdn = abs.includes("cdnsi.com") || abs.includes("livcdn.com") || abs.includes("baccdn.com");
-    if (isHot51Cdn) return `${BASE}/api/hls-proxy?url=${encodeURIComponent(abs)}`;
+    if (isHot51Cdn) {
+      // Prefer ?room= so the backend always fetches a fresh CDN token from Hot51
+      // (CDN tokens expire in ~29s; ?url= would reuse the already-fetched stale URL)
+      if (anchorId) return `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`;
+      return `${BASE}/api/hls-proxy?url=${encodeURIComponent(abs)}`;
+    }
     return abs;
   }
 
@@ -479,6 +484,34 @@ export default function LivePlayer({
     if (videoEl) try { videoEl.srcObject = null; } catch { /* ignore */ }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
+
+  // When the stream URL is refreshed (e.g. CDN token rotated every ~20s),
+  // restart HLS if the player has already tried and given up (error / blocked),
+  // so the fresh token gets a chance to succeed.
+  const prevHlsUrlRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (hlsUrl === prevHlsUrlRef.current) return;
+    prevHlsUrlRef.current = hlsUrl;
+    if (!videoEl || !hlsUrl) return;
+    // Only force-restart when the player is stuck — not while it's happily playing.
+    if (state === "error" || state === "blocked") {
+      autoRetryCountRef.current = 0;
+      zegoTriedRef.current = false;
+      hlsTriedRef.current = false;
+      flvTriedRef.current = false;
+      setZegoActive(false);
+      setState("loading");
+      setMode("none");
+      setErrorMsg("");
+      clearRetryTimer();
+      clearStallTimer();
+      destroyAll();
+      try { videoEl.srcObject = null; } catch { /* ignore */ }
+      startedRef.current = true;
+      startCdn(videoEl);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hlsUrl]);
 
   useEffect(() => {
     return () => {
