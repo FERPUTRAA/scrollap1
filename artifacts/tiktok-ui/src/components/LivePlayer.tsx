@@ -292,9 +292,12 @@ export default function LivePlayer({
       enableWorker: true,
       fragLoadingMaxRetry: 6,
       fragLoadingRetryDelay: 1000,
-      manifestLoadingMaxRetry: 4,
-      manifestLoadingRetryDelay: 1000,
-      levelLoadingMaxRetry: 4,
+      // 0 retries + tight timeout: if hls-proxy is slow / returns 502, fall
+      // through to FLV within ~12s instead of retrying for 40+ seconds.
+      manifestLoadingMaxRetry: 0,
+      manifestLoadingTimeOut: 12000,
+      levelLoadingMaxRetry: 1,
+      levelLoadingTimeOut: 12000,
       liveBackBufferLength: 0,
       xhrSetup: undefined,
     });
@@ -344,10 +347,9 @@ export default function LivePlayer({
       lastProgressRef.current = Date.now();
     };
 
-    el.onstalled = () => {
-      console.warn("[LivePlayer] HLS stalled");
-      scheduleAutoRetry(el, 4);
-    };
+    // NOTE: do NOT add el.onstalled here — HLS.js manages its own segment retry
+    // logic. onstalled fires immediately when play() is called before any segments
+    // are buffered, which would cause an instant restart loop (stuck "Memuat HLS…").
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hlsTriedRef, destroyAll, destroyHls, startFlv, streamUrl, scheduleAutoRetry, resetStallTimer]);
 

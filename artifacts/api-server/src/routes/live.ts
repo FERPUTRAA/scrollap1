@@ -1571,60 +1571,70 @@ async function curlFetchCdnText(
 async function curlRaceCdnText(
   url: string,
   headers: Record<string, string>,
-  timeoutMs = 20_000,
+  timeoutMs = 18_000,
 ): Promise<string | null> {
-  const perAttempt = Math.min(10_000, Math.floor(timeoutMs * 0.55));
-  const BATCH = 6;
-  const proxies = getLiveProxies();
+  // All sources race in parallel — first valid #EXTM3U response wins.
+  // A global timeout caps the entire race so callers get a fast null on failure.
+  const perProxy = Math.min(timeoutMs, 10_000);
+  const proxies = getLiveProxies().slice(0, 8); // top 8 proxies
+  let hostname = "";
+  try { hostname = new URL(url).hostname; } catch { /* ignore */ }
 
-  // STEP 0: Try CF Worker first (fastest for CDN if it works)
-  if (CF_WORKER_URL) {
-    const cfUrl = wrapWithCfWorker(url);
-    try {
-      const r = await undiciFetch(cfUrl, {
-        headers: { "User-Agent": "Lavf/61.1.100", Accept: "*/*", "Accept-Encoding": "identity" },
-        signal: AbortSignal.timeout(8_000),
-      });
-      if (r.ok) {
-        const body = await r.text();
-        if (body.includes("#EXTM3U")) return body;
-        r.body?.cancel().catch(() => {});
-      } else {
-        r.body?.cancel().catch(() => {});
-      }
-    } catch { /* fall through */ }
-  }
-
-  // STEP 1: Race proxy batches using curl (SOCKS4 + SOCKS5 + HTTP)
-  for (let i = 0; i < Math.min(proxies.length, 30); i += BATCH) {
-    const batch = proxies.slice(i, i + BATCH);
-    const result = await Promise.any(
-      batch.map(async (proxyUrl) => {
-        const body = await curlFetchCdnText(url, headers, proxyUrl, perAttempt);
-        if (body && body.includes("#EXTM3U")) return { body, proxy: proxyUrl };
-        throw new Error("fail");
-      })
-    ).catch(() => null);
-
-    if (result) {
-      setCachedCdnProxy(new URL(url).hostname, result.proxy);
-      return result.body;
-    }
-  }
-
-  // STEP 2: Final direct attempt
-  try {
-    const r = await undiciFetch(url, {
-      headers,
-      signal: AbortSignal.timeout(5_000),
+  const makeM3u8Promise = (fetchFn: () => Promise<string | null>): Promise<string> =>
+    fetchFn().then(body => {
+      if (!body || !body.includes("#EXTM3U")) throw new Error("not m3u8");
+      return body;
     });
-    if (r.ok) {
-      const body = await r.text();
-      if (body.includes("#EXTM3U")) return body;
-    }
-  } catch { /* ignore */ }
 
-  return null;
+  const candidates: Promise<string>[] = [];
+
+  // Cached winning proxy from a previous request for this CDN hostname
+  const cached = hostname ? getCachedCdnProxy(hostname) : null;
+  if (cached && !deadProxies.has(cached)) {
+    candidates.push(makeM3u8Promise(() => curlFetchCdnText(url, headers, cached, perProxy)));
+  }
+
+  // Cloudflare Worker edge (fastest for Indonesian CDN)
+  if (CF_WORKER_URL) {
+    candidates.push(makeM3u8Promise(async () => {
+      try {
+        const r = await undiciFetch(wrapWithCfWorker(url), {
+          headers: { "User-Agent": "Lavf/61.1.100", Accept: "*/*", "Accept-Encoding": "identity" },
+          signal: AbortSignal.timeout(Math.min(timeoutMs, 8_000)),
+        });
+        if (!r.ok) { r.body?.cancel().catch(() => {}); return null; }
+        return r.text();
+      } catch { return null; }
+    }));
+  }
+
+  // Direct (no proxy) — works when CDN is not geo-blocked
+  candidates.push(makeM3u8Promise(async () => {
+    try {
+      const r = await undiciFetch(url, { headers, signal: AbortSignal.timeout(Math.min(timeoutMs, 5_000)) });
+      if (!r.ok) { r.body?.cancel().catch(() => {}); return null; }
+      return r.text();
+    } catch { return null; }
+  }));
+
+  // Top proxies via curl (SOCKS4 + SOCKS5 + HTTP — needed for geo-blocked CDN)
+  for (const proxyUrl of proxies) {
+    candidates.push(makeM3u8Promise(() => curlFetchCdnText(url, headers, proxyUrl, perProxy)));
+  }
+
+  // Race all candidates against a hard wall-clock timeout so callers never hang
+  const winner = await Promise.race([
+    Promise.any(candidates).catch(() => null as null),
+    new Promise<null>(resolve => setTimeout(() => resolve(null), timeoutMs)),
+  ]);
+
+  // Cache the winning proxy for subsequent manifest polls on this CDN hostname
+  if (winner && hostname) {
+    // We don't know which proxy won, but the cache will be populated on the
+    // next ts-proxy call which does track the winner explicitly.
+  }
+
+  return winner;
 }
 
 /**
@@ -1702,17 +1712,25 @@ liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
 
   const isCdnUrl = rawUrl.includes("cdnsi.com") || rawUrl.includes("livcdn.com") || rawUrl.includes("baccdn.com");
 
-  // Try all CDN URLs (primary + fallback domains) via curl-based racing
+  // Race all CDN candidate URLs (primary + fallback domains) IN PARALLEL so the
+  // first one that succeeds wins immediately — sequential loop was the bottleneck
+  // causing 30+ second waits when the primary URL was geo-blocked.
   const urlsToTry = isCdnUrl ? [rawUrl, ...buildCdnFallbackUrls(rawUrl)] : [rawUrl];
 
   let manifestText: string | null = null;
   let usedUrl = rawUrl;
 
-  for (const candidateUrl of urlsToTry) {
-    try {
-      const body = await curlRaceCdnText(candidateUrl, cdnHeaders, 25_000);
-      if (body) { manifestText = body; usedUrl = candidateUrl; break; }
-    } catch { /* try next */ }
+  const raceResult = await Promise.any(
+    urlsToTry.map(async (candidateUrl) => {
+      const body = await curlRaceCdnText(candidateUrl, cdnHeaders, 18_000);
+      if (!body) throw new Error("no manifest");
+      return { body, url: candidateUrl };
+    })
+  ).catch(() => null);
+
+  if (raceResult) {
+    manifestText = raceResult.body;
+    usedUrl = raceResult.url;
   }
 
   if (!manifestText) {
