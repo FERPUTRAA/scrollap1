@@ -312,7 +312,7 @@ export default function LivePlayer({
       resetStallTimer(el);
     });
 
-    hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
       setState("playing");
       setMode("hls");
     });

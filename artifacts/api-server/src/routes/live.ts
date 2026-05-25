@@ -1619,9 +1619,15 @@ liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
       } else {
         absUrl = baseUrl + trimmed;
       }
-      // Sub-manifests (.m3u8) → route through hls-proxy, segments (.ts) → ts-proxy
+      // Sub-manifests (.m3u8) → route through hls-proxy, segments (.ts) → ts-proxy or CF worker
       if (absUrl.includes(".m3u8")) {
         return `/api/hls-proxy?url=${encodeURIComponent(absUrl)}`;
+      }
+      // For CDN TS segments: if CF worker is available, embed the CF worker URL directly
+      // so the browser fetches segments straight from Cloudflare edge — no server roundtrip needed
+      const isCdnSeg = absUrl.includes("cdnsi.com") || absUrl.includes("livcdn.com") || absUrl.includes("baccdn.com");
+      if (CF_WORKER_URL && isCdnSeg) {
+        return `${CF_WORKER_URL}/?url=${encodeURIComponent(absUrl)}`;
       }
       return `/api/ts-proxy?url=${encodeURIComponent(absUrl)}`;
     }).join("\n");
