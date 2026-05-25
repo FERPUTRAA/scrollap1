@@ -162,6 +162,7 @@ function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
       const t = setTimeout(enterRoom, 400);
       return () => clearTimeout(t);
     }
+    return undefined;
   }, [isActive, streamStatus, enterRoom]);
 
   useEffect(() => {
