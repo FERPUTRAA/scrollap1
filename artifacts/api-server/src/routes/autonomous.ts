@@ -243,7 +243,76 @@ async function callQwenStreaming(
     }
     return fullText;
   } catch (e) {
-    return `AI tidak merespons: ${e instanceof Error ? e.message : String(e)}`;
+    const errMsg = `⚠️ AI tidak merespons: ${e instanceof Error ? e.message : String(e)}`;
+    onChunk(errMsg);
+    return errMsg;
+  }
+}
+
+// Error-aware wrapper: calls onChunk so errors appear in streaming display
+async function callQwenStreamingWithErrors(
+  messages: Parameters<typeof callQwenStreaming>[0],
+  onChunk:  (text: string) => void,
+  model    = "qwen/qwen-2.5-coder-32b-instruct",
+  maxTokens = 8000,
+  closed: () => boolean = () => false,
+): Promise<string> {
+  if (!OPENROUTER_API_KEY) {
+    const msg = "⚠️ **OPENROUTER_API_KEY belum diset** — tambahkan di Replit Secrets untuk mengaktifkan AI.\n\n1. Klik ikon 🔒 Secrets di sidebar Replit\n2. Tambahkan: `OPENROUTER_API_KEY` = kunci dari https://openrouter.ai/keys\n3. Restart server";
+    onChunk(msg);
+    return msg;
+  }
+
+  try {
+    const res = await undiciFetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://replit.com",
+        "X-Title":       "Scrollap DevChat",
+      },
+      body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature: 0.2, stream: true }),
+      signal: AbortSignal.timeout(120_000),
+    });
+
+    if (!res.ok || !res.body) {
+      let errMsg: string;
+      if (res.status === 401)      errMsg = "⚠️ **API key tidak valid** — periksa OPENROUTER_API_KEY di Secrets. Pastikan kunci dari https://openrouter.ai/keys benar.";
+      else if (res.status === 429) errMsg = "⚠️ **Rate limit** — coba lagi sebentar.";
+      else if (res.status === 402) errMsg = "⚠️ **Kredit OpenRouter habis** — isi ulang di https://openrouter.ai/credits";
+      else                         errMsg = `⚠️ AI error ${res.status} — coba lagi atau ganti model.`;
+      onChunk(errMsg);
+      return errMsg;
+    }
+
+    let fullText = "";
+    const reader  = res.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = "";
+
+    while (!closed()) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      sseBuffer += decoder.decode(value, { stream: true });
+      const lines = sseBuffer.split("\n");
+      sseBuffer   = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.startsWith("data: ")) continue;
+        const data = line.slice(6).trim();
+        if (data === "[DONE]") break;
+        try {
+          const chunk = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }> };
+          const text  = chunk.choices?.[0]?.delta?.content ?? "";
+          if (text) { fullText += text; onChunk(text); }
+        } catch {}
+      }
+    }
+    return fullText;
+  } catch (e) {
+    const errMsg = `⚠️ Koneksi ke AI gagal: ${e instanceof Error ? e.message : String(e)}`;
+    onChunk(errMsg);
+    return errMsg;
   }
 }
 
@@ -737,7 +806,7 @@ autonomousRouter.post("/autonomous/chat", async (req: Request, res: Response) =>
     lastStreamedText = "";
     let   rawResponse = "";
 
-    const roundResponse = await callQwenStreaming(
+    const roundResponse = await callQwenStreamingWithErrors(
       conversationMessages,
       (text) => {
         rawResponse += text;

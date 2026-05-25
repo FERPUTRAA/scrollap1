@@ -907,7 +907,7 @@ export default function DevChat() {
                           {msg.steps&&msg.steps.length>0&&<div className="pl-5 mb-2 space-y-0.5">{msg.steps.map((step,i)=><AgentStepRow key={i} step={step}/>)}</div>}
                           {msg.filesChanged&&msg.filesChanged.length>0&&<div className="pl-5 mb-2 space-y-0.5">{msg.filesChanged.map((f,i)=><FileChangeCard key={i} f={f}/>)}</div>}
                           {msg.commandsRun&&msg.commandsRun.length>0&&<div className="pl-5 mb-2 space-y-0.5">{msg.commandsRun.map((c,i)=><CommandResultCard key={i} c={c}/>)}</div>}
-                          {msg.content&&msg.content!=="Selesai."&&<div className="pl-5">{renderContent(msg.content)}</div>}
+                          {msg.content&&<div className="pl-5">{renderContent(msg.content)}</div>}
                         </div>
                       )}
                     </div>
