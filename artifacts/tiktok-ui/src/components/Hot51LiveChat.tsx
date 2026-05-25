@@ -26,12 +26,13 @@ interface Props {
   liveId?: string;
   extraMsg?: ChatMsg | null;
   onSendComment?: (text: string) => Promise<boolean>;
+  triggerOpen?: number;
 }
 
 const USER_COLORS = ["#FF6B9D", "#69C9D0", "#FFD700", "#B44FED", "#FF8C00", "#4776E6", "#11998e", "#EE1D52"];
 function randColor() { return USER_COLORS[Math.floor(Math.random() * USER_COLORS.length)]; }
 
-export default function Hot51LiveChat({ streamerName, active, anchorId, liveId, extraMsg, onSendComment }: Props) {
+export default function Hot51LiveChat({ streamerName, active, anchorId, liveId, extraMsg, onSendComment, triggerOpen }: Props) {
   const [msgs, setMsgs] = useState<ChatMsg[]>([]);
   const [input, setInput] = useState("");
   const [showInput, setShowInput] = useState(false);
@@ -55,6 +56,11 @@ export default function Hot51LiveChat({ streamerName, active, anchorId, liveId, 
     if (extraMsg) addMsg(extraMsg);
   }, [extraMsg, addMsg]);
 
+  // Buka input komentar saat triggerOpen berubah jadi true (dari tombol komentar sidebar)
+  useEffect(() => {
+    if (triggerOpen) setShowInput(true);
+  }, [triggerOpen]);
+
   useEffect(() => {
     if (!active || !anchorId) return;
 
@@ -65,10 +71,15 @@ export default function Hot51LiveChat({ streamerName, active, anchorId, liveId, 
     sseRef.current = es;
 
     es.addEventListener("connected", () => {
-      setConnected(true);
+      // SSE terhubung — tapi belum tentu WS chat terhubung, jadi jangan set connected=true di sini
     });
 
     es.addEventListener("ws_found", () => {
+      addMsg(makeSystemMsg("Mencari chat real-time..."));
+    });
+
+    es.addEventListener("ws_connected", () => {
+      setConnected(true);
       addMsg(makeSystemMsg("Chat real-time terhubung ✓"));
     });
 
@@ -79,7 +90,15 @@ export default function Hot51LiveChat({ streamerName, active, anchorId, liveId, 
       } catch {}
     });
 
+    es.addEventListener("ws_error", (e: MessageEvent) => {
+      try {
+        const d = JSON.parse(e.data) as { note?: string };
+        addMsg(makeSystemMsg(d.note ?? "Gagal terhubung ke chat real-time"));
+      } catch {}
+    });
+
     es.addEventListener("ws_disconnected", () => {
+      setConnected(false);
       addMsg(makeSystemMsg("Chat terputus, mencoba ulang..."));
     });
 

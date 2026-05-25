@@ -571,12 +571,12 @@ export default function LivePlayer({
         </div>
       )}
 
-      {/* Mute button — center-left, vertically centered on screen */}
-      {state === "playing" && (
-        <div className="absolute top-1/2 -translate-y-1/2 left-3 z-20 flex flex-row gap-1.5 items-center">
+      {/* Mute button — tampil selama loading DAN playing, bukan hanya saat playing */}
+      {(state === "playing" || state === "loading") && (
+        <div className="absolute top-1/2 -translate-y-1/2 left-3 z-30 flex flex-row gap-1.5 items-center">
           <button
             onClick={() => setMuted((m) => !m)}
-            className="w-9 h-9 rounded-full flex items-center justify-center"
+            className="w-9 h-9 rounded-full flex items-center justify-center active:opacity-70 transition-opacity"
             style={{ background: "rgba(0,0,0,0.6)", backdropFilter: "blur(6px)", border: "1px solid rgba(255,255,255,0.15)" }}
           >
             {muted ? (
@@ -592,7 +592,7 @@ export default function LivePlayer({
               </svg>
             )}
           </button>
-          {modeBadge && (
+          {modeBadge && state === "playing" && (
             <span
               className="text-[9px] font-mono px-1.5 py-0.5 rounded"
               style={{ background: "rgba(0,0,0,0.55)", color: "rgba(255,255,255,0.55)" }}

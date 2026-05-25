@@ -57,6 +57,7 @@ export default function VideoCard({ video }: VideoCardProps) {
   const [giftOpen, setGiftOpen]         = useState(false);
   const [spinOpen, setSpinOpen]         = useState(false);
   const [vibratorOpen, setVibratorOpen] = useState(false);
+  const [chatTrigger, setChatTrigger]   = useState(0);
   const [pkActive, setPkActive]         = useState(false);
   const [pkPlayers, setPkPlayers]       = useState(makePKPlayers(video));
   const [pkTimeLeft, setPkTimeLeft]     = useState(180);
@@ -356,7 +357,9 @@ export default function VideoCard({ video }: VideoCardProps) {
       data-testid={`video-card-${video.id}`}
     >
       {/* ── Video / Cover ── */}
-      {video.isLive && video.streamUrl ? (
+      {video.isLive ? (
+        /* Render LivePlayer selalu saat isLive — meski streamUrl kosong,
+           LivePlayer akan fallback ke tryProxy → ZegoRTC secara otomatis */
         <LivePlayer
           roomId={video.id}
           anchorId={video.anchorId}
@@ -517,7 +520,7 @@ export default function VideoCard({ video }: VideoCardProps) {
         <button
           data-testid={`button-comment-${video.id}`}
           className="flex flex-col items-center gap-1"
-          onClick={(e) => { e.stopPropagation(); }}
+          onClick={(e) => { e.stopPropagation(); setChatTrigger(n => n + 1); }}
         >
           <MessageCircle size={32} color="white" strokeWidth={1.5} />
           <span className="text-white text-xs font-semibold drop-shadow">{video.comments}</span>
@@ -644,6 +647,7 @@ export default function VideoCard({ video }: VideoCardProps) {
         liveId={video.liveId ?? video.id}
         extraMsg={extraMsg}
         onSendComment={handleSendComment}
+        triggerOpen={chatTrigger > 0 ? chatTrigger : undefined}
       />
 
       {/* ── HOT51: Gift Panel ── */}

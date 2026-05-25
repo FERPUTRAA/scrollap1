@@ -1908,10 +1908,20 @@ liveRouter.post("/send-gift", async (req: Request, res: Response) => {
     { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.sendGift}`, body: JSON.stringify({ anchorId, liveId, giftId, giftNum }) },
     { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.sendPackageGift}`, body: JSON.stringify({ anchorId, liveId, giftId, giftNum }) },
   ];
+  const { anchorId: aId, liveId: lId, giftId: gId, giftNum: gNum = 1 } = req.body ?? {};
   for (const ep of endpoints) {
     try {
       const data = await hotFetch(ep.url, { method: "POST", headers: getUserHeaders(), body: ep.body, timeoutMs: 8_000 });
       if (data && typeof data === "object") {
+        // Broadcast gift event to all SSE clients for this room
+        const d = data as Record<string, unknown>;
+        const giftName = (d.giftName as string) || (d.name as string) || `Gift#${gId}`;
+        broadcastRoom(String(aId), "gift", {
+          nickname: session?.username ?? "Saya",
+          giftName,
+          giftNum: Number(gNum),
+          giftId: gId,
+        });
         res.json({ success: true, data });
         return;
       }
@@ -2037,9 +2047,20 @@ function startRoomWs(anchorId: string, wsUrl: string) {
                 cipher.setAutoPadding(true);
                 const plain = Buffer.concat([cipher.update(payload), cipher.final()]).toString("utf8");
                 const msg2 = JSON.parse(plain) as Record<string, unknown>;
-                const nn2 = (msg2.nn ?? msg2.nickname ?? "") as string;
-                const ct2 = (msg2.ct ?? msg2.content ?? "") as string;
-                broadcastRoom(anchorId, "chat", { nickname: nn2, content: ct2, decrypted: true });
+                const t2 = (msg2.t ?? msg2.type ?? msg2.tp ?? "") as string;
+                const nn2 = (msg2.nn ?? msg2.nickname ?? msg2.name ?? "") as string;
+                const ct2 = (msg2.ct ?? msg2.content ?? msg2.msg ?? "") as string;
+                // Dispatch correct event type after decryption — same mapping as plaintext
+                if (t2 === "2" || t2 === "gift") {
+                  broadcastRoom(anchorId, "gift", { nickname: nn2, giftName: msg2.gn ?? msg2.giftName, giftNum: msg2.gc ?? msg2.giftNum ?? 1, decrypted: true });
+                } else if (t2 === "3" || t2 === "join") {
+                  broadcastRoom(anchorId, "join", { nickname: nn2, decrypted: true });
+                } else if (t2 === "toy" || ct2.toString().includes("Lovense")) {
+                  broadcastRoom(anchorId, "lovense", { nickname: nn2, level: msg2.lv ?? msg2.level, duration: msg2.bt ?? msg2.baubleTime, decrypted: true });
+                } else {
+                  // Default: treat as chat (type 1 or unknown)
+                  broadcastRoom(anchorId, "chat", { nickname: nn2, content: ct2, decrypted: true });
+                }
               } catch { /* ignore */ }
             }
           }
@@ -2099,7 +2120,10 @@ liveRouter.get("/live-sse", async (req: Request, res: Response) => {
   roomWsClients.get(anchorId)!.add(send);
 
   // Try to get wsUrl and start WebSocket if not already running
-  if (!roomWsActive.get(anchorId)) {
+  if (roomWsActive.get(anchorId)) {
+    // WS sudah berjalan — beri tahu client baru bahwa sudah terhubung
+    send("ws_connected", { anchorId, note: "already_running" });
+  } else {
     try {
       const info = await fetchRoomInfo(anchorId);
       if (info?.wsUrl) {
