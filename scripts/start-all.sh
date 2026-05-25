@@ -1,15 +1,34 @@
 #!/bin/bash
 
-TAILSCALED=/nix/store/xdqdr208nmr26a0wpbm7p9qb5db3s5xb-tailscale-1.82.5/bin/tailscaled
-TAILSCALE=/nix/store/xdqdr208nmr26a0wpbm7p9qb5db3s5xb-tailscale-1.82.5/bin/tailscale
+# ── Find Tailscale binaries (dynamic — works after git clone or any deploy) ───
+_start_tailscale() {
+  local TS TSd
 
-# ── Tailscale — background, non-blocking ─────────────────────────────────────
-(
+  TSd=$(command -v tailscaled 2>/dev/null)
+  TS=$(command -v tailscale 2>/dev/null)
+
+  if [ -z "$TSd" ] && command -v curl >/dev/null 2>&1; then
+    echo "[tailscale] Binary not found — installing via official script..."
+    curl -fsSL https://tailscale.com/install.sh | sh 2>/dev/null || true
+    TSd=$(command -v tailscaled 2>/dev/null)
+    TS=$(command -v tailscale 2>/dev/null)
+  fi
+
+  if [ -z "$TAILSCALE_AUTH_KEY" ]; then
+    echo "[tailscale] Skipping: TAILSCALE_AUTH_KEY is not set"
+    return 0
+  fi
+
+  if [ -z "$TSd" ]; then
+    echo "[tailscale] Skipping: tailscaled not available"
+    return 0
+  fi
+
   mkdir -p /tmp/tailscale-state
   pkill tailscaled 2>/dev/null || true
   sleep 1
 
-  "$TAILSCALED" \
+  "$TSd" \
     --tun=userspace-networking \
     --statedir=/tmp/tailscale-state \
     --socket=/tmp/tailscale.sock \
@@ -24,15 +43,20 @@ TAILSCALE=/nix/store/xdqdr208nmr26a0wpbm7p9qb5db3s5xb-tailscale-1.82.5/bin/tails
   done
 
   if [ -S /tmp/tailscale.sock ]; then
-    "$TAILSCALE" --socket=/tmp/tailscale.sock up \
+    "$TS" --socket=/tmp/tailscale.sock up \
       --authkey="$TAILSCALE_AUTH_KEY" \
       --accept-routes \
       --advertise-exit-node \
       --hostname="scrollap-server" 2>&1 || true
-    "$TAILSCALE" --socket=/tmp/tailscale.sock set --advertise-exit-node 2>/dev/null || true
-    echo "[tailscale] IP: $("$TAILSCALE" --socket=/tmp/tailscale.sock ip -4 2>/dev/null || echo 'pending')"
+    "$TS" --socket=/tmp/tailscale.sock set --advertise-exit-node 2>/dev/null || true
+    echo "[tailscale] IP: $("$TS" --socket=/tmp/tailscale.sock ip -4 2>/dev/null || echo 'pending')"
+  else
+    echo "[tailscale] Socket not ready after 20s — check /tmp/tailscaled.log"
   fi
-) &
+}
+
+# ── Tailscale — background, non-blocking ─────────────────────────────────────
+( _start_tailscale ) &
 
 # ── Frontend (Vite) — background on port 5000 ────────────────────────────────
 echo "[ui] Starting frontend on port 5000..."
