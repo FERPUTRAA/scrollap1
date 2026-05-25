@@ -313,6 +313,7 @@ export default function LivePlayer({
     });
 
     hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+      setState("playing");
       setMode("hls");
     });
 
@@ -320,11 +321,8 @@ export default function LivePlayer({
       if (data.fatal) {
         console.warn("[LivePlayer] HLS fatal error:", data.type, data.details);
         destroyHls();
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          scheduleAutoRetry(el, 3);
-        } else {
-          startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
-        }
+        // Always fall through to FLV on any fatal HLS error (matching GitHub behaviour)
+        startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
       } else {
         if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
             data.details === Hls.ErrorDetails.BUFFER_NUDGE_ON_STALL) {

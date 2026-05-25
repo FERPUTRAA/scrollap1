@@ -1417,9 +1417,16 @@ async function fetchViaBestProxy(
     }
   } catch { /* URL parse error */ }
 
+  // STEP 1: Try direct connection first (fast, and CDN may not geo-block Replit)
+  try {
+    const r = await undiciFetch(url, { headers, signal: AbortSignal.timeout(3_000) });
+    if (r.ok) return { res: r, proxy: null };
+    r.body?.cancel().catch(() => {});
+  } catch { /* geo-blocked or timeout — fall through to proxy pool */ }
+
   const liveProxies = getLiveProxies();
 
-  // STEP 1: Race proxies in parallel batches — first 2xx response wins
+  // STEP 2: Race proxies in parallel batches — first 2xx response wins
   for (let i = 0; i < Math.min(liveProxies.length, 30); i += BATCH_SIZE) {
     const batch = liveProxies.slice(i, i + BATCH_SIZE);
     const result = await Promise.any(batch.map(tryProxy)).catch(() => null);
@@ -1436,7 +1443,7 @@ async function fetchViaBestProxy(
     }
   }
 
-  // STEP 2: Last resort — direct connection (useful for non-geo-blocked endpoints)
+  // STEP 3: Final direct attempt with longer timeout
   try {
     const r = await undiciFetch(url, { headers, signal: AbortSignal.timeout(Math.min(timeoutMs, 5_000)) });
     if (r.ok) return { res: r, proxy: null };
