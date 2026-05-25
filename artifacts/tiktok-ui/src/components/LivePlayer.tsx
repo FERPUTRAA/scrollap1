@@ -77,8 +77,8 @@ export default function LivePlayer({
     const el = containerRef.current;
     if (!el) return;
     const observer = new IntersectionObserver(
-      ([entry]) => setVisible(entry.isIntersecting && entry.intersectionRatio >= 0.5),
-      { threshold: 0.5 }
+      ([entry]) => setVisible(entry.isIntersecting),
+      { threshold: [0, 0.05] }
     );
     observer.observe(el);
     return () => observer.disconnect();
@@ -108,6 +108,17 @@ export default function LivePlayer({
     destroyFlv();
     clearStallTimer();
   }, [destroyHls, destroyFlv, clearStallTimer]);
+
+  const toHlsProxyUrl = useCallback((url: string): string => {
+    const abs = toAbsoluteUrl(url);
+    if (abs.includes("/api/hls-proxy") || abs.includes("/api/ts-proxy")) return abs;
+    const isHot51Cdn = abs.includes("cdnsi.com") || abs.includes("livcdn.com") || abs.includes("baccdn.com");
+    if (isHot51Cdn) {
+      if (anchorId) return `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`;
+      return `${BASE}/api/hls-proxy?url=${encodeURIComponent(abs)}`;
+    }
+    return abs;
+  }, [anchorId]);
 
   const doFullRetry = useCallback((el: HTMLVideoElement) => {
     clearRetryTimer();
@@ -141,7 +152,7 @@ export default function LivePlayer({
       tryProxy(el);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hlsUrl, streamUrl, clearRetryTimer, clearStallTimer, destroyAll]);
+  }, [hlsUrl, streamUrl, clearRetryTimer, clearStallTimer, destroyAll, toHlsProxyUrl]);
 
   const scheduleAutoRetry = useCallback((el: HTMLVideoElement, delaySec?: number) => {
     clearRetryTimer();
@@ -378,19 +389,6 @@ export default function LivePlayer({
     }
   }, [roomId, anchorId, liveId, startFlv, startZego]);
 
-  function toHlsProxyUrl(url: string): string {
-    const abs = toAbsoluteUrl(url);
-    if (abs.includes("/api/hls-proxy") || abs.includes("/api/ts-proxy")) return abs;
-    const isHot51Cdn = abs.includes("cdnsi.com") || abs.includes("livcdn.com") || abs.includes("baccdn.com");
-    if (isHot51Cdn) {
-      // Prefer ?room= so the backend always fetches a fresh CDN token from Hot51
-      // (CDN tokens expire in ~29s; ?url= would reuse the already-fetched stale URL)
-      if (anchorId) return `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`;
-      return `${BASE}/api/hls-proxy?url=${encodeURIComponent(abs)}`;
-    }
-    return abs;
-  }
-
   const startCdn = useCallback((el: HTMLVideoElement) => {
     const rawHls = hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null);
     if (rawHls) {
@@ -411,7 +409,7 @@ export default function LivePlayer({
       tryProxy(el);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hlsUrl, streamUrl, startHls, startFlv, tryProxy]);
+  }, [hlsUrl, streamUrl, startHls, startFlv, tryProxy, toHlsProxyUrl]);
 
   const handleZegoPlaying = useCallback(() => {
     setMode("zego");
@@ -486,15 +484,20 @@ export default function LivePlayer({
   }, [roomId]);
 
   // When the stream URL is refreshed (e.g. CDN token rotated every ~20s),
-  // restart HLS if the player has already tried and given up (error / blocked),
+  // restart HLS if the player has already tried and given up (error / blocked / stuck loading),
   // so the fresh token gets a chance to succeed.
   const prevHlsUrlRef = useRef<string | undefined>(undefined);
+  const loadingStartRef = useRef<number>(0);
+  useEffect(() => {
+    if (state === "loading") loadingStartRef.current = Date.now();
+  }, [state]);
   useEffect(() => {
     if (hlsUrl === prevHlsUrlRef.current) return;
     prevHlsUrlRef.current = hlsUrl;
     if (!videoEl || !hlsUrl) return;
-    // Only force-restart when the player is stuck — not while it's happily playing.
-    if (state === "error" || state === "blocked") {
+    // Restart when: errored, blocked, or stuck in loading for > 8s
+    const loadingStuck = state === "loading" && Date.now() - loadingStartRef.current > 8_000;
+    if (state === "error" || state === "blocked" || loadingStuck) {
       autoRetryCountRef.current = 0;
       zegoTriedRef.current = false;
       hlsTriedRef.current = false;

@@ -574,7 +574,7 @@ function isApiOk(data: unknown): boolean {
 }
 
 let cache: { ts: number; rooms: ProcessedRoom[]; total: number } | null = null;
-const CACHE_TTL = 2 * 60_000;
+const CACHE_TTL = 20_000;
 
 /**
  * Unwrap HOT51 API response envelope.
