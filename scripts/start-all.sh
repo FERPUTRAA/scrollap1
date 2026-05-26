@@ -58,15 +58,9 @@ _start_tailscale() {
 # ── Tailscale — background, non-blocking ─────────────────────────────────────
 ( _start_tailscale ) &
 
-# ── Frontend (Vite) — background on port 5000 ────────────────────────────────
+# ── Frontend (Vite) — foreground on port 5000 (satisfies waitForPort=5000) ───
+# API is started separately by the artifacts/api-server: API Server workflow
 echo "[ui] Starting frontend on port 5000..."
-(
-  export PORT=5000
-  export BASE_PATH=/
-  exec pnpm run --filter @workspace/tiktok-ui dev
-) &
-
-# ── API Server — foreground (keeps workflow alive, port 8080) ─────────────────
-echo "[api] Starting on port 8080..."
-export PORT=8080
-exec pnpm run --filter @workspace/api-server dev
+export PORT=5000
+export BASE_PATH=/
+exec pnpm run --filter @workspace/tiktok-ui dev
