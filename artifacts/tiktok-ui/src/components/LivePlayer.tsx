@@ -114,6 +114,13 @@ export default function LivePlayer({
     if (abs.includes("/api/hls-proxy") || abs.includes("/api/ts-proxy")) return abs;
     const isHot51Cdn = abs.includes("cdnsi.com") || abs.includes("livcdn.com") || abs.includes("baccdn.com");
     if (isHot51Cdn) {
+      // If the URL already has .m3u8 (full URL with signed token from live-rooms),
+      // use ?url= directly — fast path, no extra Hot51 API call needed.
+      if (abs.includes(".m3u8")) {
+        return `${BASE}/api/hls-proxy?url=${encodeURIComponent(abs)}`;
+      }
+      // Partial URL (no .m3u8, no token) — use ?room= so the backend calls
+      // getRealStreamUrl to get a fresh signed URL from Hot51 API.
       if (anchorId) return `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`;
       return `${BASE}/api/hls-proxy?url=${encodeURIComponent(abs)}`;
     }
@@ -123,16 +130,42 @@ export default function LivePlayer({
   const doFullRetry = useCallback((el: HTMLVideoElement) => {
     clearRetryTimer();
     clearStallTimer();
-    zegoTriedRef.current = false;
-    hlsTriedRef.current = false;
-    flvTriedRef.current = false;
-    setZegoActive(false);
+    destroyAll();
+    try { el.srcObject = null; } catch { /* ignore */ }
     startedRef.current = true;
     setState("loading");
     setMode("none");
     setErrorMsg("");
-    destroyAll();
-    try { el.srcObject = null; } catch { /* ignore */ }
+
+    const retryCount = autoRetryCountRef.current;
+
+    // After 2 HLS failures → escalate: Zego → FLV → blocked.
+    // This prevents the infinite HLS retry loop when a stream is offline.
+    if (retryCount >= 2) {
+      if (zegoStreamId && !zegoTriedRef.current) {
+        zegoTriedRef.current = true;
+        hlsTriedRef.current = true;
+        flvTriedRef.current = true;
+        setZegoActive(true);
+        return;
+      }
+      if (streamUrl && !flvTriedRef.current) {
+        hlsTriedRef.current = true;
+        flvTriedRef.current = true;
+        zegoTriedRef.current = true;
+        startFlv(toAbsoluteUrl(streamUrl), el);
+        return;
+      }
+      setState("blocked");
+      setErrorMsg("Stream tidak tersedia saat ini");
+      return;
+    }
+
+    // Normal HLS retry path (first 2 attempts)
+    zegoTriedRef.current = false;
+    hlsTriedRef.current = false;
+    flvTriedRef.current = false;
+    setZegoActive(false);
     const rawHls = hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null);
     if (rawHls) {
       startHls(toHlsProxyUrl(rawHls), el);
@@ -152,7 +185,7 @@ export default function LivePlayer({
       tryProxy(el);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hlsUrl, streamUrl, clearRetryTimer, clearStallTimer, destroyAll, toHlsProxyUrl]);
+  }, [hlsUrl, streamUrl, zegoStreamId, clearRetryTimer, clearStallTimer, destroyAll, toHlsProxyUrl]);
 
   const scheduleAutoRetry = useCallback((el: HTMLVideoElement, delaySec?: number) => {
     clearRetryTimer();
@@ -314,32 +347,41 @@ export default function LivePlayer({
     });
     hlsRef.current = hls;
 
+    console.info("[LivePlayer] HLS loadSource:", url.substring(0, 100));
     hls.loadSource(url);
     hls.attachMedia(el);
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      el.play().catch(() => {});
+      console.info("[LivePlayer] MANIFEST_PARSED — calling play()");
+      el.play().catch((e) => console.warn("[LivePlayer] play() rejected:", e));
     });
 
-    hls.on(Hls.Events.FRAG_LOADED, () => {
+    hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
+      console.info("[LivePlayer] FRAG_LOADED sn:", data.frag.sn);
       lastProgressRef.current = Date.now();
       resetStallTimer(el);
     });
 
     hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      console.info("[LivePlayer] MANIFEST_PARSED — setState playing");
       setState("playing");
       setMode("hls");
     });
 
     hls.on(Hls.Events.ERROR, (_event, data) => {
+      const httpStatus = (data.response as { code?: number } | undefined)?.code;
+      console.warn("[LivePlayer] HLS error fatal:", data.fatal, "type:", data.type, "details:", data.details, "http:", httpStatus);
       if (data.fatal) {
-        console.warn("[LivePlayer] HLS fatal error:", data.type, data.details);
         destroyHls();
-        // Retry HLS instead of falling to FLV — CDN is HLS-only (no FLV URLs),
-        // and the hls-proxy takes ~15s through Indonesian proxy pool so a
-        // network-timeout error just means the first attempt was too slow.
-        // scheduleAutoRetry resets hlsTriedRef so startHls runs fresh.
-        scheduleAutoRetry(el, 5);
+        if (httpStatus === 502 || httpStatus === 503) {
+          // Server-side failure (stream offline/unavailable) — fast-track escalation.
+          // Bump the retry count so the next doFullRetry tries Zego, not HLS again.
+          autoRetryCountRef.current = Math.max(autoRetryCountRef.current, 1);
+          scheduleAutoRetry(el, 2);
+        } else {
+          // Network timeout or transient error — give HLS a chance to recover.
+          scheduleAutoRetry(el, 5);
+        }
       } else {
         if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
             data.details === Hls.ErrorDetails.BUFFER_NUDGE_ON_STALL) {

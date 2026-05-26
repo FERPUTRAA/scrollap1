@@ -684,12 +684,20 @@ async function fetchRoomInfo(anchorId: string): Promise<RoomInfoResult | null> {
     // ahp = anchor head photo, cu = cover URL
     const avatar = (d.ahp as string) || (d.cu as string) || undefined;
 
-    // unlDefPa — AES-128-CBC encrypted HLS URL for guest viewers (always present)
-    // Decrypted using keys reversed from libnative-lib.so: key=getCommonAesKey, iv=getCommonAesIv
+    // 1. Scan the full response for .m3u8 URLs with signed tokens (pullAddr265, etc.)
+    //    These come with expire+sign params and are directly playable without getRealStreamUrl.
+    const scannedUrl = scanStreamUrl(d) ?? undefined;
+
+    // 2. unlDefPa — AES-128-CBC encrypted HLS URL for guest viewers (always present)
+    //    Decrypted using keys reversed from libnative-lib.so: key=getCommonAesKey, iv=getCommonAesIv
     const unlDefPa = (d.unlDefPa as string) || undefined;
-    const hlsUrl = unlDefPa
+    const decryptedUrl = unlDefPa
       ? (decryptHot51Field(unlDefPa, HOT51_ROOM_URL_KEY, HOT51_ROOM_URL_IV) ?? undefined)
       : undefined;
+
+    // Prefer the scanned URL if it has .m3u8 (signed token → directly playable);
+    // fall back to the decrypted unlDefPa URL (may be a partial path without token).
+    const hlsUrl = scannedUrl?.includes(".m3u8") ? scannedUrl : (decryptedUrl ?? scannedUrl);
 
     // wsu — AES-128-CBC encrypted WebSocket URL
     const wsuRaw = (d.wsu as string) || undefined;
@@ -848,32 +856,38 @@ async function fetchLiveRooms(): Promise<{ rooms: ProcessedRoom[]; total: number
   return cache;
 }
 
-async function getRealStreamUrl(roomId: string, anchorId: string, liveId?: string): Promise<string | null> {
-  // Also scan HLS stream URL fields — Hot51 app primarily uses HLS (.m3u8), not FLV
-  const STREAM_FIELDS = [
-    "pullAddr", "pullAddr265", "pullAddress", "pullUrl", "pullFlvUrl", "pullHlsUrl",
-    "flvUrl", "hlsUrl", "m3u8Url", "hlsAddr", "playUrl", "streamUrl",
-    "flvStreamUrl", "hlsStreamUrl", "liveUrl", "rtmpStreamUrl",
-  ];
+/** Stream URL field names used when scanning Hot51 API responses */
+const HOT51_STREAM_FIELDS = [
+  "pullAddr", "pullAddr265", "pullAddress", "pullUrl", "pullFlvUrl", "pullHlsUrl",
+  "flvUrl", "hlsUrl", "m3u8Url", "hlsAddr", "playUrl", "streamUrl",
+  "flvStreamUrl", "hlsStreamUrl", "liveUrl", "rtmpStreamUrl",
+];
 
-  const scan = (obj: unknown, depth = 0): string | null => {
-    if (!obj || typeof obj !== "object" || depth > 8) return null;
-    for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
-      if (
-        STREAM_FIELDS.some(f => k.toLowerCase().includes(f.toLowerCase())) &&
-        typeof v === "string" && v.length > 10 &&
-        (v.startsWith("http") || v.startsWith("rtmp")) &&
-        (v.includes(".flv") || v.includes(".m3u8") || v.includes("/live/"))
-      ) {
-        return v;
-      }
-      if (v && typeof v === "object") {
-        const found = scan(v, depth + 1);
-        if (found) return found;
-      }
+/**
+ * Recursively scan a Hot51 API response object for any stream URL field.
+ * Prefers HLS (.m3u8) URLs; also accepts FLV and bare CDN /live/ paths.
+ * Returns the FIRST match found (depth-first), or null.
+ */
+function scanStreamUrl(obj: unknown, depth = 0): string | null {
+  if (!obj || typeof obj !== "object" || depth > 8) return null;
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (
+      HOT51_STREAM_FIELDS.some(f => k.toLowerCase().includes(f.toLowerCase())) &&
+      typeof v === "string" && v.length > 10 &&
+      (v.startsWith("http") || v.startsWith("rtmp")) &&
+      (v.includes(".flv") || v.includes(".m3u8") || v.includes("/live/"))
+    ) {
+      return v;
     }
-    return null;
-  };
+    if (v && typeof v === "object") {
+      const found = scanStreamUrl(v, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+async function getRealStreamUrl(roomId: string, anchorId: string, liveId?: string): Promise<string | null> {
 
   // Endpoints from APK smali analysis — body formats match exact APK captured traffic
   const lid = liveId ?? roomId;
@@ -917,11 +931,13 @@ async function getRealStreamUrl(roomId: string, anchorId: string, liveId?: strin
       }) as Record<string, unknown>;
       // Skip only hard error codes, not 0 (success) or missing code
       if (data.errorCode && Number(data.errorCode) !== 0) continue;
-      // 1. Check unlDefPa (encrypted HLS URL — always present for guest viewers)
+      // 1. Check standard URL fields first — prefer .m3u8 URLs with signed tokens
+      const found = scanStreamUrl(data);
+      if (found?.includes(".m3u8")) return found;
+      // 2. Check unlDefPa (encrypted HLS URL — always present for guest viewers)
       const decryptedUrl = scanUnlDefPa(data);
       if (decryptedUrl) return decryptedUrl;
-      // 2. Check standard URL fields (pullAddr, hlsUrl, etc.)
-      const found = scan(data);
+      // 3. Fall back to any stream URL found (FLV or partial CDN path)
       if (found) return found;
     } catch {
       continue;
@@ -1702,15 +1718,24 @@ function spawnCurlStream(
 liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
   let rawUrl = String(req.query.url ?? "");
 
-  // ?room={anchorId} — fetch a fresh stream URL, ignoring the rooms cache
+  // ?room={anchorId} — fetch a fresh stream URL via Hot51 API
   const roomParam = String(req.query.room ?? "");
   if (roomParam && !rawUrl) {
     const freshUrl = await getRealStreamUrl(roomParam, roomParam).catch(() => null);
     if (!freshUrl) {
-      res.status(502).json({ error: "Could not obtain fresh stream URL for room", room: roomParam });
-      return;
+      // Fallback: try the live-rooms in-memory cache for a cached URL
+      const cachedRoom = cache?.rooms.find(r => r.anchorId === roomParam || r.id === roomParam);
+      const cachedUrl = cachedRoom?.hlsUrl ?? cachedRoom?.streamUrl ?? "";
+      if (cachedUrl.startsWith("http")) {
+        rawUrl = cachedUrl;
+      } else {
+        // Stream is offline and not in cache — signal frontend to try Zego/FLV
+        res.status(503).json({ error: "Stream offline or unavailable", room: roomParam, offline: true });
+        return;
+      }
+    } else {
+      rawUrl = freshUrl;
     }
-    rawUrl = freshUrl;
   }
 
   if (!rawUrl || !rawUrl.startsWith("http")) {
