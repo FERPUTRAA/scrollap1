@@ -303,12 +303,12 @@ export default function LivePlayer({
       enableWorker: true,
       fragLoadingMaxRetry: 6,
       fragLoadingRetryDelay: 1000,
-      // 0 retries + tight timeout: if hls-proxy is slow / returns 502, fall
-      // through to FLV within ~12s instead of retrying for 40+ seconds.
+      // hls-proxy fetches through an Indonesian proxy pool which takes ~15s.
+      // Allow 25s so the manifest request succeeds before the timeout fires.
       manifestLoadingMaxRetry: 0,
-      manifestLoadingTimeOut: 12000,
+      manifestLoadingTimeOut: 25000,
       levelLoadingMaxRetry: 1,
-      levelLoadingTimeOut: 12000,
+      levelLoadingTimeOut: 25000,
       liveBackBufferLength: 0,
       xhrSetup: undefined,
     });
@@ -335,8 +335,11 @@ export default function LivePlayer({
       if (data.fatal) {
         console.warn("[LivePlayer] HLS fatal error:", data.type, data.details);
         destroyHls();
-        // Always fall through to FLV on any fatal HLS error (matching GitHub behaviour)
-        startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
+        // Retry HLS instead of falling to FLV — CDN is HLS-only (no FLV URLs),
+        // and the hls-proxy takes ~15s through Indonesian proxy pool so a
+        // network-timeout error just means the first attempt was too slow.
+        // scheduleAutoRetry resets hlsTriedRef so startHls runs fresh.
+        scheduleAutoRetry(el, 5);
       } else {
         if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
             data.details === Hls.ErrorDetails.BUFFER_NUDGE_ON_STALL) {
