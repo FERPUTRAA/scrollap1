@@ -58,9 +58,22 @@ _start_tailscale() {
 # ── Tailscale — background, non-blocking ─────────────────────────────────────
 ( _start_tailscale ) &
 
+# ── API Server — background on port 8080 ─────────────────────────────────────
+echo "[api] Building and starting API server on port 8080..."
+PORT=8080 NODE_ENV=development pnpm run --filter @workspace/api-server dev &
+API_PID=$!
+
+# Wait for API server to be ready (up to 30s)
+for i in $(seq 1 30); do
+  sleep 1
+  if curl -sf http://localhost:8080/api/healthz >/dev/null 2>&1; then
+    echo "[api] API server ready"
+    break
+  fi
+done
+
 # ── Frontend (Vite) — foreground on port 5000 (satisfies waitForPort=5000) ───
-# API is started separately by the artifacts/api-server: API Server workflow
 echo "[ui] Starting frontend on port 5000..."
 export PORT=5000
 export BASE_PATH=/
-exec pnpm run --filter @workspace/tiktok-ui dev
+pnpm run --filter @workspace/tiktok-ui dev
