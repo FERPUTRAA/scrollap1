@@ -670,7 +670,10 @@ interface RoomInfoResult {
 /** Fetch real room metadata from room-info API */
 async function fetchRoomInfo(anchorId: string): Promise<RoomInfoResult | null> {
   const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getRoomInfo}`);
-  const body = JSON.stringify({ anchorId, isSupportH265: true, spH5: 1 });
+  // Force H.264 by setting isSupportH265: false — CDN returns a different stream key
+  // for H.265 vs H.264. Most browsers (Chrome/Firefox) don't support H.265 in MSE,
+  // causing bufferAddCodecError. Only Safari on macOS/iOS supports H.265 via MSE.
+  const body = JSON.stringify({ anchorId, isSupportH265: false, spH5: 1 });
   try {
     const raw = await hotFetch(url, {
       method: "POST",
@@ -699,9 +702,13 @@ async function fetchRoomInfo(anchorId: string): Promise<RoomInfoResult | null> {
       ? (decryptHot51Field(unlDefPa, HOT51_ROOM_URL_KEY, HOT51_ROOM_URL_IV) ?? undefined)
       : undefined;
 
-    // Prefer the scanned URL if it has .m3u8 (signed token → directly playable);
-    // fall back to the decrypted unlDefPa URL (may be a partial path without token).
-    const hlsUrl = scannedUrl?.includes(".m3u8") ? scannedUrl : (decryptedUrl ?? scannedUrl);
+    // PRIORITY: unlDefPa (decrypted) → always H.264 on bcdn5.livcdn.com, always present for guests.
+    // scannedUrl may be pullAddr265 (H.265 on cdnsi.com) which causes bufferAddCodecError in Chrome/Firefox.
+    // Only fall back to scannedUrl if decryptedUrl is unavailable or not a full URL.
+    const decryptedIsUsable = decryptedUrl?.startsWith("http") ?? false;
+    const hlsUrl = decryptedIsUsable
+      ? decryptedUrl
+      : (scannedUrl?.includes(".m3u8") ? scannedUrl : (decryptedUrl ?? scannedUrl));
 
     // wsu — AES-128-CBC encrypted WebSocket URL
     const wsuRaw = (d.wsu as string) || undefined;
@@ -757,10 +764,12 @@ async function enrichRooms(
           gameName: info.gameName || r.gameName,
           // Avatar from ahp/cu fields in room-info
           ...(info.avatar && { anchorAvatarUrl: info.avatar }),
-          // If room-info returned a stream URL, use it
-          ...(info.pullAddr    && { pullAddr:    info.pullAddr }),
-          ...(info.pullAddr265 && { hlsStreamUrl: info.pullAddr265 }),
-          // unlDefPa decrypted HLS URL — always present for guest viewers (highest priority)
+          // If room-info returned a stream URL, use it.
+          // NOTE: pullAddr265 is intentionally skipped — it's an H.265 stream that causes
+          // bufferAddCodecError in Chrome/Firefox. We use pullAddr (H.264 FLV) or
+          // unlDefPa-decrypted hlsUrl (H.264 HLS) instead.
+          ...(info.pullAddr && { pullAddr: info.pullAddr }),
+          // unlDefPa decrypted HLS URL — H.264 since we request isSupportH265:false
           ...(info.hlsUrl && { hlsStreamUrl: info.hlsUrl }),
         });
       } else {
@@ -860,9 +869,12 @@ async function fetchLiveRooms(): Promise<{ rooms: ProcessedRoom[]; total: number
   return cache;
 }
 
-/** Stream URL field names used when scanning Hot51 API responses */
+/** Stream URL field names used when scanning Hot51 API responses.
+ *  NOTE: pullAddr265 is intentionally excluded — it holds an H.265/HEVC stream URL
+ *  which causes bufferAddCodecError in Chrome/Firefox MSE. We use unlDefPa (AES-decrypted
+ *  H.264 guest URL) instead. */
 const HOT51_STREAM_FIELDS = [
-  "pullAddr", "pullAddr265", "pullAddress", "pullUrl", "pullFlvUrl", "pullHlsUrl",
+  "pullAddr", "pullAddress", "pullUrl", "pullFlvUrl", "pullHlsUrl",
   "flvUrl", "hlsUrl", "m3u8Url", "hlsAddr", "playUrl", "streamUrl",
   "flvStreamUrl", "hlsStreamUrl", "liveUrl", "rtmpStreamUrl",
 ];
@@ -896,10 +908,11 @@ async function getRealStreamUrl(roomId: string, anchorId: string, liveId?: strin
   // Endpoints from APK smali analysis — body formats match exact APK captured traffic
   const lid = liveId ?? roomId;
   const endpoints = [
-    // PRIMARY: room-info — body confirmed from real APK capture (isSupportH265+spH5 required)
-    { body: JSON.stringify({ anchorId, isSupportH265: true, spH5: 1 }), url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getRoomInfo}`) },
-    // Enter-room v4
-    { body: JSON.stringify({ anchorId, isSupportH265: true, spH5: 1 }), url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.enterRoomV4}`) },
+    // PRIMARY: room-info — force H.264 (isSupportH265:false) so CDN returns H.264 stream key.
+    // H.265 causes bufferAddCodecError in Chrome/Firefox MSE; only Safari supports H.265 MSE.
+    { body: JSON.stringify({ anchorId, isSupportH265: false, spH5: 1 }), url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getRoomInfo}`) },
+    // Enter-room v4 — also force H.264
+    { body: JSON.stringify({ anchorId, isSupportH265: false, spH5: 1 }), url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.enterRoomV4}`) },
     // Enter-room v3 (fallback)
     { body: JSON.stringify({ anchorId, roomId, liveId: lid }),           url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.enterRoomV3}`) },
     // swipe-switch — cover+living only, but may contain stream fields
