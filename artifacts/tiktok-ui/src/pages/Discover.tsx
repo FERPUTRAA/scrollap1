@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from "react";
-import { Search, TrendingUp, Music, Hash, Radio, ExternalLink, Loader } from "lucide-react";
+import { Search, TrendingUp, Music, Hash, Radio, ExternalLink, Loader, Film } from "lucide-react";
 import { MOCK_DISCOVER_TRENDS, MOCK_VIDEOS } from "../data/mock";
 
 const SOUNDS = [
@@ -29,11 +29,22 @@ interface SwagSession {
   url?: string;
 }
 
+interface JavVideo {
+  id: number;
+  code: string;
+  title: string;
+  studio: string;
+  thumbnail: string;
+  url: string;
+}
+
 export default function Discover() {
   const [query, setQuery] = useState("");
   const [swagSessions, setSwagSessions] = useState<SwagSession[]>([]);
   const [swagLoading, setSwagLoading] = useState(true);
   const [swagError, setSwagError] = useState(false);
+  const [javVideos, setJavVideos] = useState<JavVideo[]>([]);
+  const [javLoading, setJavLoading] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -58,6 +69,22 @@ export default function Discover() {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    setJavLoading(true);
+
+    fetch("/api/jav")
+      .then(r => r.json())
+      .then((d: { success: boolean; videos?: JavVideo[] }) => {
+        if (cancelled) return;
+        setJavLoading(false);
+        if (d.success && d.videos) setJavVideos(d.videos);
+      })
+      .catch(() => { if (!cancelled) setJavLoading(false); });
+
+    return () => { cancelled = true; };
+  }, []);
+
   return (
     <div className="h-full w-full overflow-y-auto no-scrollbar bg-black">
       <div className="sticky top-0 z-10 bg-black px-4 pt-12 pb-3">
@@ -75,6 +102,48 @@ export default function Discover() {
       </div>
 
       <div className="px-4 pb-20">
+
+        {/* ── JAV Section ────────────────────────────────────────────────── */}
+        <div className="mb-6">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-2">
+              <Film size={16} color="#E8335D" />
+              <h2 className="text-white font-bold text-sm">JAV — Jable.tv</h2>
+            </div>
+            <a
+              href="https://jable.tv/new-releases/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1 text-white/40 text-[10px]"
+            >
+              Lihat semua <ExternalLink size={10} />
+            </a>
+          </div>
+
+          {javLoading ? (
+            <div className="flex items-center justify-center py-6">
+              <Loader size={20} className="animate-spin text-white/30" />
+            </div>
+          ) : javVideos.length === 0 ? (
+            <a
+              href="https://jable.tv"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block rounded-2xl px-4 py-4 text-center"
+              style={{ background: "rgba(232,51,93,0.1)", border: "1px solid rgba(232,51,93,0.2)" }}
+            >
+              <Film size={24} color="#E8335D" className="mx-auto mb-1" />
+              <p className="text-white text-sm font-semibold">Jable.tv</p>
+              <p className="text-white/40 text-[11px]">Free JAV streaming</p>
+            </a>
+          ) : (
+            <div className="grid grid-cols-3 gap-2">
+              {javVideos.slice(0, 12).map((v) => (
+                <JavCard key={v.id} video={v} />
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* ── Swag Live Section ─────────────────────────────────────────── */}
         <div className="mb-6">
@@ -192,6 +261,45 @@ export default function Discover() {
         </div>
       </div>
     </div>
+  );
+}
+
+function JavCard({ video }: { video: JavVideo }) {
+  const [imgErr, setImgErr] = useState(false);
+
+  return (
+    <a
+      href={video.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="block cursor-pointer"
+    >
+      <div
+        className="rounded-xl overflow-hidden relative mb-1"
+        style={{ aspectRatio: "3/2", background: "#1a1a1a" }}
+      >
+        {!imgErr ? (
+          <img
+            src={video.thumbnail}
+            alt={video.code}
+            className="w-full h-full object-cover"
+            loading="lazy"
+            onError={() => setImgErr(true)}
+          />
+        ) : (
+          <div className="w-full h-full flex items-center justify-center">
+            <Film size={16} color="rgba(232,51,93,0.4)" />
+          </div>
+        )}
+        <div
+          className="absolute top-1 left-1 text-[8px] font-bold px-1.5 py-0.5 rounded"
+          style={{ background: "rgba(0,0,0,0.75)", color: "#E8335D" }}
+        >
+          {video.studio}
+        </div>
+      </div>
+      <p className="text-white text-[10px] font-bold truncate">{video.code}</p>
+    </a>
   );
 }
 

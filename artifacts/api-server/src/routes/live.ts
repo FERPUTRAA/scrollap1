@@ -2347,6 +2347,44 @@ liveRouter.post("/save-recording", (req: Request, res: Response) => {
   res.json({ success: true, recording: entry });
 });
 
+/** GET /api/jav — return JAV video list from jable.tv CDN (thumbnails publicly accessible) */
+const JAV_VIDEOS = [
+  { id: 59428, code: "START-575", title: "START-575", studio: "S1" },
+  { id: 59410, code: "MOGI-310", title: "MOGI-310", studio: "MOGI" },
+  { id: 59400, code: "SONE-714", title: "SONE-714", studio: "S1" },
+  { id: 59390, code: "STARS-916", title: "STARS-916", studio: "SOD" },
+  { id: 59380, code: "MIDV-810", title: "MIDV-810", studio: "MOODYZ" },
+  { id: 59370, code: "FSDSS-815", title: "FSDSS-815", studio: "FHD" },
+  { id: 59365, code: "JUR-737", title: "JUR-737", studio: "Madonna" },
+  { id: 59350, code: "DASS-469", title: "DASS-469", studio: "Das!" },
+  { id: 59340, code: "ROYD-130", title: "ROYD-130", studio: "Rookie" },
+  { id: 59330, code: "MANE-070", title: "MANE-070", studio: "Mane" },
+  { id: 59320, code: "MEYD-890", title: "MEYD-890", studio: "TAMEIKE" },
+  { id: 59310, code: "JUFD-985", title: "JUFD-985", studio: "Fitch" },
+  { id: 59300, code: "SONE-712", title: "SONE-712", studio: "S1" },
+  { id: 59280, code: "MIDV-808", title: "MIDV-808", studio: "MOODYZ" },
+  { id: 59260, code: "STARS-914", title: "STARS-914", studio: "SOD" },
+  { id: 59240, code: "IPX-710", title: "IPX-710", studio: "IdeaPocket" },
+  { id: 59220, code: "EBOD-978", title: "EBOD-978", studio: "E-BODY" },
+  { id: 59200, code: "HMN-635", title: "HMN-635", studio: "Honnaka" },
+  { id: 59180, code: "CAWD-745", title: "CAWD-745", studio: "Kawaii" },
+  { id: 59160, code: "FSDSS-812", title: "FSDSS-812", studio: "FHD" },
+  { id: 59140, code: "MOGI-308", title: "MOGI-308", studio: "MOGI" },
+  { id: 59120, code: "DASS-467", title: "DASS-467", studio: "Das!" },
+  { id: 59100, code: "SSIS-992", title: "SSIS-992", studio: "S1" },
+  { id: 59080, code: "MIDV-806", title: "MIDV-806", studio: "MOODYZ" },
+];
+
+liveRouter.get("/jav", (_req: Request, res: Response) => {
+  res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
+  const videos = JAV_VIDEOS.map(v => ({
+    ...v,
+    thumbnail: `https://assets-cdn.jable.tv/contents/videos_screenshots/${Math.floor(v.id / 1000) * 1000}/${v.id}/preview.jpg`,
+    url: `https://jable.tv/videos/${v.code.toLowerCase()}/`,
+  }));
+  res.json({ success: true, videos });
+});
+
 /** GET /api/swag-live — proxy Swag Live public session discovery */
 liveRouter.get("/swag-live", async (_req: Request, res: Response) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
