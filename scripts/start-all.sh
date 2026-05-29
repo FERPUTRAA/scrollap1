@@ -60,6 +60,9 @@ _start_tailscale() {
 
 # ── API Server — background on port 8080 ─────────────────────────────────────
 echo "[api] Building and starting API server on port 8080..."
+# Kill any existing process holding port 8080 so a restart always gets fresh code
+fuser -k 8080/tcp 2>/dev/null || true
+sleep 1
 PORT=8080 NODE_ENV=development pnpm run --filter @workspace/api-server dev &
 API_PID=$!
 

@@ -178,12 +178,15 @@ export default function LivePlayer({
       maxBufferLength: 10,
       maxMaxBufferLength: 30,
       enableWorker: true,
-      // Allow up to 25s for manifest — hls-proxy fetches fresh token from Hot51 API
-      manifestLoadingTimeOut: 25_000,
-      manifestLoadingMaxRetry: 2,
+      // Backend hls-proxy has 10s timeout on getRealStreamUrl, add 3s buffer
+      manifestLoadingTimeOut: 13_000,
+      manifestLoadingMaxRetry: 1,
       fragLoadingMaxRetry: 4,
       fragLoadingRetryDelay: 1_000,
       liveBackBufferLength: 0,
+      xhrSetup: (_xhr: XMLHttpRequest, xhrUrl: string) => {
+        console.info("[LivePlayer] XHR →", xhrUrl.substring(0, 80));
+      },
     });
     hlsRef.current = hls;
 
@@ -199,9 +202,10 @@ export default function LivePlayer({
     });
 
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      console.warn("[LivePlayer] HLS error fatal:", data.fatal, "details:", data.details);
+      console.warn("[LivePlayer] HLS error:", data.details, "fatal:", data.fatal, "type:", data.type);
       if (data.fatal) {
         destroyHls();
+        // 503 = stream offline — skip directly to FLV/Zego (no point retrying HLS)
         startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
       } else {
         if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||

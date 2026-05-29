@@ -576,6 +576,10 @@ function isApiOk(data: unknown): boolean {
 let cache: { ts: number; rooms: ProcessedRoom[]; total: number } | null = null;
 const CACHE_TTL = 20_000;
 
+// Cache for getRealStreamUrl results — CDN tokens valid ~29s, cache for 15s
+const streamUrlCache = new Map<string, { url: string; ts: number }>();
+const STREAM_URL_CACHE_TTL = 15_000;
+
 /**
  * Unwrap HOT51 API response envelope.
  * The API returns either a raw array/object OR {"code":200,"data":[...]} wrapper.
@@ -1716,25 +1720,38 @@ function spawnCurlStream(
  * (tokens expire in ~29 seconds, the cache would serve stale URLs otherwise).
  */
 liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
+  // Log immediately so we know the request arrived (before any async work)
+  req.log.info({ url: req.url }, "hls-proxy start");
+
   let rawUrl = String(req.query.url ?? "");
 
   // ?room={anchorId} — fetch a fresh stream URL via Hot51 API
   const roomParam = String(req.query.room ?? "");
   if (roomParam && !rawUrl) {
-    const freshUrl = await getRealStreamUrl(roomParam, roomParam).catch(() => null);
-    if (!freshUrl) {
-      // Fallback: try the live-rooms in-memory cache for a cached URL
-      const cachedRoom = cache?.rooms.find(r => r.anchorId === roomParam || r.id === roomParam);
-      const cachedUrl = cachedRoom?.hlsUrl ?? cachedRoom?.streamUrl ?? "";
-      if (cachedUrl.startsWith("http")) {
-        rawUrl = cachedUrl;
-      } else {
-        // Stream is offline and not in cache — signal frontend to try Zego/FLV
-        res.status(503).json({ error: "Stream offline or unavailable", room: roomParam, offline: true });
-        return;
-      }
+    // Check short-lived cache first (CDN tokens valid ~29s, cache 15s)
+    const hit = streamUrlCache.get(roomParam);
+    if (hit && Date.now() - hit.ts < STREAM_URL_CACHE_TTL) {
+      rawUrl = hit.url;
     } else {
-      rawUrl = freshUrl;
+      // Race getRealStreamUrl against a 10s timeout so we never block hls.js >10s
+      const freshUrl = await Promise.race<string | null>([
+        getRealStreamUrl(roomParam, roomParam).catch(() => null),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
+      ]);
+      if (freshUrl) {
+        streamUrlCache.set(roomParam, { url: freshUrl, ts: Date.now() });
+        rawUrl = freshUrl;
+      } else {
+        // Fallback: try the live-rooms in-memory cache for a cached URL
+        const cachedRoom = cache?.rooms.find(r => r.anchorId === roomParam || r.id === roomParam);
+        const cachedUrl = cachedRoom?.hlsUrl ?? cachedRoom?.streamUrl ?? "";
+        if (cachedUrl.startsWith("http")) {
+          rawUrl = cachedUrl;
+        } else {
+          res.status(503).json({ error: "Stream offline or unavailable", room: roomParam, offline: true });
+          return;
+        }
+      }
     }
   }
 
@@ -1751,7 +1768,7 @@ liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
     Origin: "https://hot51.com",
   };
 
-  req.log.info({ url: rawUrl }, "hls-proxy start");
+  req.log.info({ url: rawUrl }, "hls-proxy fetching manifest");
 
   const isCdnUrl = rawUrl.includes("cdnsi.com") || rawUrl.includes("livcdn.com") || rawUrl.includes("baccdn.com");
 
@@ -2328,6 +2345,71 @@ liveRouter.post("/save-recording", (req: Request, res: Response) => {
   recordings.push(entry);
   if (recordings.length > 100) recordings.shift();
   res.json({ success: true, recording: entry });
+});
+
+/** GET /api/swag-live — proxy Swag Live public session discovery */
+liveRouter.get("/swag-live", async (_req: Request, res: Response) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "public, max-age=30, s-maxage=30");
+
+  try {
+    // Try to get live sessions from Swag Live public API
+    const tryFetch = async (url: string) => {
+      const r = await undiciFetch(url, {
+        headers: {
+          Accept: "application/json",
+          "x-version": "8.3.0",
+          "x-client-id": "web",
+          "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.120 Mobile Safari/537.36",
+          Origin: "https://swag.live",
+          Referer: "https://swag.live/",
+        },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.json() as Promise<unknown>;
+    };
+
+    // Try multiple known discovery endpoints
+    const endpoints = [
+      "https://api.swag.live/sessions?isLive=true&limit=20",
+      "https://api.swag.live/sessions?live=true&limit=20",
+      "https://api.swag.live/broadcast/live?limit=20",
+      "https://api.swag.live/rooms/live?limit=20",
+    ];
+
+    let data: unknown = null;
+    for (const ep of endpoints) {
+      try {
+        data = await tryFetch(ep);
+        if (data && typeof data === "object") break;
+      } catch { continue; }
+    }
+
+    if (data && typeof data === "object") {
+      return res.json({ success: true, source: "swag.live", data });
+    }
+
+    // Return placeholder showing Swag Live platform info
+    return res.json({
+      success: true,
+      source: "swag.live",
+      placeholder: true,
+      data: {
+        sessions: [],
+        total: 0,
+        message: "Swag Live requires authentication for live discovery",
+        platform: {
+          name: "Swag Live",
+          url: "https://swag.live",
+          logo: "https://swag.live/favicon.ico",
+          description: "Global live streaming platform",
+        },
+      },
+    });
+  } catch (e) {
+    return res.status(502).json({ success: false, error: String(e) });
+  }
 });
 
 export default liveRouter;
