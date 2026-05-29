@@ -1725,31 +1725,42 @@ liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
 
   let rawUrl = String(req.query.url ?? "");
 
-  // ?room={anchorId} — fetch a fresh stream URL via Hot51 API
+  // ?room={anchorId} — resolve fresh stream URL, preferring cached data to avoid Hot51 rate-limiting
   const roomParam = String(req.query.room ?? "");
   if (roomParam && !rawUrl) {
-    // Check short-lived cache first (CDN tokens valid ~29s, cache 15s)
+    // Priority 1: short-lived stream URL cache (15s TTL) — fastest path
     const hit = streamUrlCache.get(roomParam);
     if (hit && Date.now() - hit.ts < STREAM_URL_CACHE_TTL) {
       rawUrl = hit.url;
     } else {
-      // Race getRealStreamUrl against a 10s timeout so we never block hls.js >10s
-      const freshUrl = await Promise.race<string | null>([
-        getRealStreamUrl(roomParam, roomParam).catch(() => null),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
-      ]);
-      if (freshUrl) {
-        streamUrlCache.set(roomParam, { url: freshUrl, ts: Date.now() });
-        rawUrl = freshUrl;
+      // Priority 2: live-rooms cache — fetchLiveRooms already called room-info; reuse its result.
+      // Tokens from enrichRooms are signed with expire ~29s from issue time; live-rooms cache
+      // TTL is 20s, so tokens are always valid when read from here. This avoids redundant Hot51
+      // API calls (which cause rate-limiting when called immediately after fetchLiveRooms).
+      const cachedRoom = cache?.rooms.find(r => r.anchorId === roomParam || r.id === roomParam);
+      const cachedHlsUrl = cachedRoom?.hlsUrl?.startsWith("http") ? cachedRoom.hlsUrl : null;
+      if (cachedHlsUrl) {
+        streamUrlCache.set(roomParam, { url: cachedHlsUrl, ts: Date.now() });
+        rawUrl = cachedHlsUrl;
       } else {
-        // Fallback: try the live-rooms in-memory cache for a cached URL
-        const cachedRoom = cache?.rooms.find(r => r.anchorId === roomParam || r.id === roomParam);
-        const cachedUrl = cachedRoom?.hlsUrl ?? cachedRoom?.streamUrl ?? "";
-        if (cachedUrl.startsWith("http")) {
-          rawUrl = cachedUrl;
+        // Priority 3: call getRealStreamUrl directly (last resort — may be slow or rate-limited)
+        req.log.info({ room: roomParam }, "hls-proxy: cache miss, calling getRealStreamUrl");
+        const freshUrl = await Promise.race<string | null>([
+          getRealStreamUrl(roomParam, roomParam).catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 10_000)),
+        ]);
+        if (freshUrl) {
+          streamUrlCache.set(roomParam, { url: freshUrl, ts: Date.now() });
+          rawUrl = freshUrl;
         } else {
-          res.status(503).json({ error: "Stream offline or unavailable", room: roomParam, offline: true });
-          return;
+          // Last fallback: use streamUrl from live-rooms cache even if hlsUrl is empty
+          const fallbackUrl = cachedRoom?.streamUrl?.startsWith("http") ? cachedRoom.streamUrl : null;
+          if (fallbackUrl) {
+            rawUrl = fallbackUrl;
+          } else {
+            res.status(503).json({ error: "Stream offline atau tidak tersedia saat ini", room: roomParam, offline: true });
+            return;
+          }
         }
       }
     }

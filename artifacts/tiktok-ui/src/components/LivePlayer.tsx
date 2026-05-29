@@ -57,6 +57,8 @@ export default function LivePlayer({
   const zegoTriedRef = useRef(false);
   const hlsTriedRef = useRef(false);
   const flvTriedRef = useRef(false);
+  // Track the URL currently loaded by HLS.js so we can detect token refreshes
+  const activeHlsSourceRef = useRef<string>("");
 
   useEffect(() => {
     const el = containerRef.current;
@@ -178,17 +180,17 @@ export default function LivePlayer({
       maxBufferLength: 10,
       maxMaxBufferLength: 30,
       enableWorker: true,
-      // Backend hls-proxy has 10s timeout on getRealStreamUrl, add 3s buffer
       manifestLoadingTimeOut: 13_000,
-      manifestLoadingMaxRetry: 1,
-      fragLoadingMaxRetry: 4,
-      fragLoadingRetryDelay: 1_000,
+      manifestLoadingMaxRetry: 2,
+      fragLoadingMaxRetry: 6,
+      fragLoadingRetryDelay: 800,
       liveBackBufferLength: 0,
       xhrSetup: (_xhr: XMLHttpRequest, xhrUrl: string) => {
         console.info("[LivePlayer] XHR →", xhrUrl.substring(0, 80));
       },
     });
     hlsRef.current = hls;
+    activeHlsSourceRef.current = url;
 
     console.info("[LivePlayer] HLS loadSource:", url.substring(0, 100));
     hls.loadSource(url);
@@ -327,6 +329,7 @@ export default function LivePlayer({
     zegoTriedRef.current = false;
     hlsTriedRef.current = false;
     flvTriedRef.current = false;
+    activeHlsSourceRef.current = "";
     setZegoActive(false);
     setState("idle");
     setMode("none");
@@ -336,6 +339,20 @@ export default function LivePlayer({
     if (videoEl) try { videoEl.srcObject = null; } catch { /* ignore */ }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
+
+  // When Feed.tsx refreshes hlsUrl every 20s (new signed CDN token), reload the HLS source
+  // without destroying/recreating the player — this keeps the stream playing continuously
+  // even as the 29s CDN tokens expire and get replaced.
+  useEffect(() => {
+    if (!hlsRef.current || !hlsUrl) return;
+    const newProxyUrl = anchorId
+      ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
+      : `${BASE}/api/hls-proxy?url=${encodeURIComponent(toAbsoluteUrl(hlsUrl))}`;
+    if (newProxyUrl === activeHlsSourceRef.current) return;
+    console.info("[LivePlayer] hlsUrl refreshed → reloading HLS source");
+    activeHlsSourceRef.current = newProxyUrl;
+    hlsRef.current.loadSource(newProxyUrl);
+  }, [hlsUrl, anchorId]);
 
   useEffect(() => {
     return () => {
