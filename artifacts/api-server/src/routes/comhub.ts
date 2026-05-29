@@ -197,17 +197,67 @@ function extractRoomList(data: CHApiResponse<unknown>): CHLiveRoom[] | null {
 }
 
 // ── Living list cache ──────────────────────────────────────────────
-interface LivingCache { rooms: NormalizedRoom[]; ts: number }
+interface LivingCache { rooms: NormalizedRoom[]; ts: number; source: "comhub" | "hot51" }
 let livingCache: LivingCache | null = null;
 const LIVING_CACHE_TTL = 60_000;
+
+// streamId/roomId → full HLS URL (populated from Hot51 fallback)
+const hot51StreamMap = new Map<string, string>();
+
+interface Hot51Room {
+  id: string; anchorId: string; liveId: string;
+  name: string; viewers: number; cover: string; avatar: string;
+  liveName: string; hlsUrl: string; streamUrl: string; streamProxyUrl: string;
+}
+
+async function fetchHot51FallbackRooms(): Promise<NormalizedRoom[]> {
+  const port = process.env.PORT ?? "8080";
+  const r = await undiciFetch(`http://127.0.0.1:${port}/api/live-rooms`, {
+    signal: AbortSignal.timeout(15_000),
+  });
+  if (!r.ok) return [];
+  const data = await r.json() as { success: boolean; rooms?: Hot51Room[] };
+  if (!data.success || !data.rooms?.length) return [];
+
+  hot51StreamMap.clear();
+  return data.rooms
+    .filter(rm => rm.hlsUrl || rm.streamUrl || rm.streamProxyUrl)
+    .map(rm => {
+      const hls = rm.hlsUrl || rm.streamUrl || rm.streamProxyUrl;
+      // Index by both liveId and roomId for quick /enter lookup
+      hot51StreamMap.set(rm.liveId, hls);
+      hot51StreamMap.set(rm.id, hls);
+      hot51StreamMap.set(rm.anchorId, hls);
+      return {
+        userId:      0,
+        liveId:      rm.liveId,
+        roomId:      rm.id,
+        nickname:    rm.name || "Host",
+        avatar:      rm.avatar || rm.cover,
+        coverUrl:    rm.cover || rm.avatar,
+        viewerCount: rm.viewers ?? 0,
+        streamId:    hls,    // HLS URL stored as streamId
+        title:       rm.liveName || "Live",
+        countryCode: "ID",
+      };
+    });
+}
 
 async function fetchLivingRooms(): Promise<{ rooms: NormalizedRoom[]; noAuth: boolean; error?: string }> {
   if (livingCache && Date.now() - livingCache.ts < LIVING_CACHE_TTL) {
     return { rooms: livingCache.rooms, noAuth: false };
   }
 
+  // No ComHub token → use Hot51 data directly (no login needed)
   if (!CREDS.valid || !CREDS.token) {
-    return { rooms: [], noAuth: true, error: "COMHUB_AUTH_TOKEN belum diset di Replit Secrets" };
+    try {
+      const rooms = await fetchHot51FallbackRooms();
+      if (rooms.length > 0) {
+        livingCache = { rooms, ts: Date.now(), source: "hot51" };
+        return { rooms, noAuth: false };
+      }
+    } catch { /* fallthrough to error */ }
+    return { rooms: [], noAuth: false, error: "Tidak ada siaran live saat ini" };
   }
 
   // GET endpoints — vchat/app paths from www.comhub.live (from traffic capture)
@@ -386,12 +436,23 @@ comhubRouter.get("/comhub/living", async (_req: Request, res: Response) => {
 comhubRouter.post("/comhub/enter", async (req: Request, res: Response) => {
   const { liveId, roomId } = req.body as { liveId?: string; roomId?: string };
   const rid = liveId ?? roomId;
-  if (!CREDS.valid || !CREDS.token) {
-    res.status(401).json({ success: false, error: "auth_required" });
-    return;
-  }
   if (!rid) {
     res.status(400).json({ success: false, error: "liveId atau roomId diperlukan" });
+    return;
+  }
+
+  // No ComHub token → serve HLS URL from Hot51 fallback map
+  if (!CREDS.valid || !CREDS.token) {
+    // Try to ensure the map is populated
+    if (hot51StreamMap.size === 0) {
+      try { await fetchHot51FallbackRooms(); } catch { /* ignore */ }
+    }
+    const hlsUrl = hot51StreamMap.get(rid) ?? null;
+    if (hlsUrl) {
+      res.json({ success: true, hlsUrl, pullUrl: hlsUrl, roomId: rid, streamId: rid, zegoAppId: ZEGO_APP_ID });
+    } else {
+      res.json({ success: false, error: "Stream tidak ditemukan", noAuth: true });
+    }
     return;
   }
 

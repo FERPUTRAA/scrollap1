@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { WifiOff, RefreshCw, Eye, Tv2, X, Loader2, Key, Settings } from "lucide-react";
+import { WifiOff, RefreshCw, Eye, Tv2, X, Loader2, Settings } from "lucide-react";
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 
@@ -12,7 +12,7 @@ interface LiveRoom {
   avatar: string;
   coverUrl: string;
   viewerCount: number;
-  streamId: string;
+  streamId: string;   // May contain HLS URL for Hot51 fallback rooms
   title: string;
   countryCode: string;
 }
@@ -26,109 +26,9 @@ interface StreamInfo {
   hlsUrl?: string;
   flvUrl?: string;
   rtmpUrl?: string;
-  enterRaw?: Record<string, unknown>;
-  streamRaw?: Record<string, unknown>;
 }
 
-type ListStatus = "loading" | "ok" | "error" | "empty" | "no-auth";
-
-// ── Setup Guide (shown when no token, non-blocking) ────────────────
-function SetupGuide({ onTokenSaved }: { onTokenSaved: () => void }) {
-  const [token, setToken] = useState("");
-  const [userId, setUserId] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState("");
-  const [saved, setSaved] = useState(false);
-
-  const handleSave = async () => {
-    if (!token.trim()) { setErr("Token diperlukan"); return; }
-    setSaving(true); setErr("");
-    try {
-      const res = await fetch(`${BASE}/api/comhub/credentials`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ authToken: token.trim(), userId: userId.trim() }),
-      });
-      const data = await res.json() as { success: boolean; error?: string };
-      if (data.success) { setSaved(true); setTimeout(onTokenSaved, 800); }
-      else { setErr(data.error ?? "Token tidak valid"); }
-    } catch { setErr("Gagal menyimpan token"); }
-    finally { setSaving(false); }
-  };
-
-  return (
-    <div className="flex flex-col items-center justify-center h-full px-6 gap-5" style={{ background: "#0a1628" }}>
-      <div className="w-14 h-14 rounded-2xl flex items-center justify-center"
-        style={{ background: "linear-gradient(135deg,#22c55e,#16a34a)" }}>
-        <Tv2 size={28} color="white" />
-      </div>
-      <div className="text-center">
-        <h2 className="text-white font-bold text-base">ComHub Live</h2>
-        <p className="text-white/50 text-xs mt-1">Perlu token ComHub untuk memuat siaran Indonesia</p>
-      </div>
-
-      <div className="w-full max-w-sm rounded-2xl p-4 flex flex-col gap-3"
-        style={{ background: "rgba(255,255,255,0.05)", border: "1px solid rgba(34,197,94,0.2)" }}>
-        <div className="flex items-center gap-2 mb-1">
-          <Key size={13} color="rgba(134,239,172,0.8)" />
-          <span className="text-green-300 text-xs font-semibold">Token ComHub</span>
-        </div>
-        <div className="p-2.5 rounded-xl text-[10px] leading-relaxed"
-          style={{ background: "rgba(34,197,94,0.07)", border: "1px solid rgba(34,197,94,0.15)", color: "rgba(134,239,172,0.7)" }}>
-          Cara mendapatkan token:<br />
-          1. Buka app ComHub → Settings → Akun<br />
-          2. Atau intercept header: <span className="font-mono text-green-300">Authorization: Bearer ...</span><br />
-          3. Atau set <span className="font-mono text-green-300">COMHUB_AUTH_TOKEN</span> di Replit Secrets
-        </div>
-        <textarea value={token} onChange={e => setToken(e.target.value)}
-          placeholder="Paste token ComHub di sini..."
-          rows={3}
-          className="w-full px-3 py-2 rounded-xl text-xs text-white placeholder-white/25 outline-none font-mono resize-none"
-          style={{ background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.1)" }} />
-        <input value={userId} onChange={e => setUserId(e.target.value)}
-          placeholder="User ID (opsional)"
-          className="w-full px-3 py-2 rounded-xl text-sm text-white placeholder-white/25 outline-none"
-          style={{ background: "rgba(255,255,255,0.07)", border: "1px solid rgba(255,255,255,0.1)" }} />
-        {err && <p className="text-red-400 text-xs">{err}</p>}
-        <button onClick={handleSave} disabled={saving || saved}
-          className="w-full py-2.5 rounded-xl font-bold text-sm text-white flex items-center justify-center gap-2"
-          style={{ background: saved ? "rgba(34,197,94,0.6)" : "rgba(34,197,94,0.85)" }}>
-          {saving ? <Loader2 size={14} className="animate-spin" /> : saved ? "✓ Tersimpan!" : "Simpan & Lanjut"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ── Stream Debug Panel ─────────────────────────────────────────────
-function StreamDebugPanel({ info, onClose }: { info: StreamInfo; onClose: () => void }) {
-  const rows: Array<[string, string]> = [
-    ["ZEGO App ID", String(info.zegoAppId ?? "-")],
-    ["Room ID", info.roomId ?? "-"],
-    ["Stream ID", info.streamId ?? "-"],
-    ["Pull URL", info.pullUrl ?? "-"],
-    ["HLS URL", info.hlsUrl ?? "-"],
-    ["FLV URL", info.flvUrl ?? "-"],
-    ["ZEGO Token", info.zegoToken ? `${info.zegoToken.slice(0, 32)}...` : "-"],
-  ];
-  return (
-    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
-      className="absolute inset-x-3 bottom-28 z-50 rounded-2xl p-4 overflow-auto max-h-60"
-      style={{ background: "rgba(0,0,0,0.93)", border: "1px solid rgba(34,197,94,0.3)", backdropFilter: "blur(12px)" }}>
-      <div className="flex items-center justify-between mb-3">
-        <span className="text-green-400 text-xs font-bold">Stream Info</span>
-        <button onClick={onClose}><X size={14} color="rgba(255,255,255,0.5)" /></button>
-      </div>
-      <div className="flex flex-col gap-1.5">
-        {rows.map(([k, v]) => (
-          <div key={k} className="flex gap-2">
-            <span className="text-white/40 text-[10px] w-20 shrink-0">{k}</span>
-            <span className="text-green-300 text-[10px] font-mono break-all">{v}</span>
-          </div>
-        ))}
-      </div>
-    </motion.div>
-  );
-}
+type ListStatus = "loading" | "ok" | "error" | "empty";
 
 // ── Room Card ──────────────────────────────────────────────────────
 function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
@@ -150,12 +50,26 @@ function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
         setStreamInfo(data);
         setStreamStatus("ok");
       } else {
-        setStreamStatus("error");
+        // Fallback: if streamId in room looks like an HLS URL, use it directly
+        const directUrl = room.streamId?.startsWith("http") ? room.streamId : null;
+        if (directUrl) {
+          setStreamInfo({ hlsUrl: directUrl, pullUrl: directUrl, roomId: room.roomId });
+          setStreamStatus("ok");
+        } else {
+          setStreamStatus("error");
+        }
       }
     } catch {
-      setStreamStatus("error");
+      // Network error fallback
+      const directUrl = room.streamId?.startsWith("http") ? room.streamId : null;
+      if (directUrl) {
+        setStreamInfo({ hlsUrl: directUrl, pullUrl: directUrl, roomId: room.roomId });
+        setStreamStatus("ok");
+      } else {
+        setStreamStatus("error");
+      }
     }
-  }, [room.liveId, room.roomId]);
+  }, [room.liveId, room.roomId, room.streamId]);
 
   useEffect(() => {
     if (isActive && streamStatus === "idle") {
@@ -167,7 +81,6 @@ function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
 
   useEffect(() => {
     if (!isActive) {
-      // Destroy HLS instance when leaving card
       if (hlsRef.current) {
         (hlsRef.current as { destroy: () => void }).destroy();
         hlsRef.current = null;
@@ -194,6 +107,9 @@ function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
           hls.loadSource(hlsUrl);
           hls.attachMedia(video);
           hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); });
+          hls.on(Hls.Events.ERROR, (_e: unknown, d: { fatal: boolean }) => {
+            if (d.fatal) setStreamStatus("error");
+          });
         } else if (video.canPlayType("application/vnd.apple.mpegurl")) {
           video.src = hlsUrl;
           video.play().catch(() => {});
@@ -236,7 +152,7 @@ function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
         <span className="text-white text-[10px] font-black tracking-wide">LIVE</span>
       </div>
 
-      {/* Indonesia flag badge */}
+      {/* Flag badge */}
       <div className="absolute top-16 left-20 z-20 flex items-center gap-1 px-2 py-1 rounded-full"
         style={{ background: "rgba(0,0,0,0.5)", backdropFilter: "blur(6px)" }}>
         <span className="text-[11px]">🇮🇩</span>
@@ -250,7 +166,7 @@ function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
         <span className="text-white/80 text-[10px] font-semibold">{room.viewerCount.toLocaleString()}</span>
       </div>
 
-      {/* Stream status */}
+      {/* Stream status indicator */}
       {isActive && (
         <div className="absolute top-28 left-3 z-20">
           {streamStatus === "loading" && (
@@ -270,9 +186,28 @@ function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
         </div>
       )}
 
-      {/* Debug panel */}
+      {/* Debug toggle */}
       <AnimatePresence>
-        {showDebug && streamInfo && <StreamDebugPanel info={streamInfo} onClose={() => setShowDebug(false)} />}
+        {showDebug && streamInfo && (
+          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}
+            className="absolute inset-x-3 bottom-28 z-50 rounded-2xl p-4 overflow-auto max-h-52"
+            style={{ background: "rgba(0,0,0,0.93)", border: "1px solid rgba(34,197,94,0.3)" }}>
+            <div className="flex justify-between mb-2">
+              <span className="text-green-400 text-xs font-bold">Stream Info</span>
+              <button onClick={() => setShowDebug(false)}><X size={14} color="rgba(255,255,255,0.5)" /></button>
+            </div>
+            {[
+              ["HLS URL", streamInfo.hlsUrl ?? streamInfo.pullUrl ?? "-"],
+              ["Room ID", streamInfo.roomId ?? "-"],
+              ["Stream ID", streamInfo.streamId ?? "-"],
+            ].map(([k, v]) => (
+              <div key={k} className="flex gap-2 mb-1">
+                <span className="text-white/40 text-[10px] w-20 shrink-0">{k}</span>
+                <span className="text-green-300 text-[10px] font-mono break-all">{v}</span>
+              </div>
+            ))}
+          </motion.div>
+        )}
       </AnimatePresence>
 
       {/* Bottom info */}
@@ -302,19 +237,11 @@ function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
         )}
       </div>
 
-      {/* No stream — show ZEGO info */}
+      {/* No stream placeholder */}
       {!hasStream && streamStatus === "ok" && streamInfo && (
         <div className="absolute inset-0 flex flex-col items-center justify-center z-10 gap-3">
-          <div className="w-16 h-16 rounded-full flex items-center justify-center"
-            style={{ background: "rgba(34,197,94,0.08)", border: "2px solid rgba(34,197,94,0.25)" }}>
-            <Tv2 size={30} color="rgba(134,239,172,0.6)" />
-          </div>
-          <div className="text-center px-6">
-            <p className="text-green-300 text-sm font-semibold">ZEGO Live</p>
-            <p className="text-white/40 text-xs mt-1">
-              Room: {streamInfo.roomId ?? "-"}
-            </p>
-          </div>
+          <Tv2 size={30} color="rgba(134,239,172,0.4)" />
+          <p className="text-green-300/50 text-sm">Room: {streamInfo.roomId ?? room.roomId}</p>
         </div>
       )}
     </div>
@@ -341,12 +268,8 @@ export default function ComHub() {
         rooms?: LiveRoom[];
       };
 
-      if (data.noAuth) {
-        setListStatus("no-auth");
-        return;
-      }
       if (!data.success || !data.rooms?.length) {
-        setErrorMsg(data.error ?? "Belum ada siaran Indonesia");
+        setErrorMsg(data.error ?? "Belum ada siaran live saat ini");
         setListStatus(data.rooms?.length === 0 ? "empty" : "error");
         return;
       }
@@ -362,7 +285,6 @@ export default function ComHub() {
 
   useEffect(() => { fetchRooms(); }, [fetchRooms]);
 
-  // Auto-refresh every 90 seconds
   useEffect(() => {
     const iv = setInterval(fetchRooms, 90_000);
     return () => clearInterval(iv);
@@ -375,17 +297,12 @@ export default function ComHub() {
     if (idx !== activeIndex) setActiveIndex(idx);
   }, [activeIndex]);
 
-  // ── No Auth — show setup guide ────────────────────────────────────
-  if (listStatus === "no-auth" || showSettings) {
-    return <SetupGuide onTokenSaved={() => { setShowSettings(false); fetchRooms(); }} />;
-  }
-
   // ── Loading ───────────────────────────────────────────────────────
   if (listStatus === "loading") {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-4" style={{ background: "#0a1628" }}>
         <div className="w-12 h-12 rounded-full border-4 border-white/20 border-t-green-400 animate-spin" />
-        <p className="text-white/60 text-sm">Memuat ComHub Indonesia…</p>
+        <p className="text-white/60 text-sm">Memuat siaran live Indonesia…</p>
       </div>
     );
   }
@@ -396,18 +313,11 @@ export default function ComHub() {
       <div className="flex flex-col items-center justify-center h-full gap-5 px-8" style={{ background: "#0a1628" }}>
         <WifiOff size={44} color="rgba(255,255,255,0.3)" />
         <p className="text-white/80 text-base font-semibold text-center">{errorMsg || "Gagal memuat siaran"}</p>
-        <div className="flex gap-2">
-          <button onClick={fetchRooms}
-            className="px-5 py-2.5 rounded-full text-white font-bold text-sm flex items-center gap-2"
-            style={{ background: "rgba(34,197,94,0.8)" }}>
-            <RefreshCw size={13} />Coba Lagi
-          </button>
-          <button onClick={() => setShowSettings(true)}
-            className="px-5 py-2.5 rounded-full text-white font-bold text-sm flex items-center gap-2"
-            style={{ background: "rgba(255,255,255,0.1)" }}>
-            <Settings size={13} />Token
-          </button>
-        </div>
+        <button onClick={fetchRooms}
+          className="px-5 py-2.5 rounded-full text-white font-bold text-sm flex items-center gap-2"
+          style={{ background: "rgba(34,197,94,0.8)" }}>
+          <RefreshCw size={13} />Coba Lagi
+        </button>
       </div>
     );
   }
@@ -418,7 +328,6 @@ export default function ComHub() {
       <div className="flex flex-col items-center justify-center h-full gap-5 px-8" style={{ background: "#0a1628" }}>
         <span className="text-5xl">🇮🇩</span>
         <p className="text-white/80 text-base font-semibold text-center">Belum ada host Indonesia yang live</p>
-        <p className="text-white/40 text-sm text-center">Coba lagi beberapa saat</p>
         <button onClick={fetchRooms}
           className="px-6 py-2.5 rounded-full text-white font-bold text-sm flex items-center gap-2"
           style={{ background: "rgba(34,197,94,0.8)" }}>
@@ -430,7 +339,6 @@ export default function ComHub() {
 
   return (
     <div className="relative w-full h-full flex flex-col" style={{ background: "#0a1628" }}>
-
       {/* Top bar */}
       <div className="absolute top-0 left-0 right-0 z-50 flex items-center justify-between pt-14 pb-3 px-3 pointer-events-none"
         style={{ background: "linear-gradient(to bottom,rgba(0,0,0,0.8) 0%,transparent 100%)" }}>
@@ -445,17 +353,45 @@ export default function ComHub() {
             🇮🇩 Indonesia
           </span>
         </div>
-
         <div className="pointer-events-auto flex items-center gap-2">
           <span className="text-white/40 text-[10px]">{rooms.length} live</span>
           <button onClick={fetchRooms} className="p-1">
             <RefreshCw size={15} color="rgba(255,255,255,0.6)" />
           </button>
-          <button onClick={() => setShowSettings(true)} className="p-1">
+          <button onClick={() => setShowSettings(s => !s)} className="p-1">
             <Settings size={15} color="rgba(255,255,255,0.4)" />
           </button>
         </div>
       </div>
+
+      {/* Settings drawer — token entry (optional, doesn't block) */}
+      <AnimatePresence>
+        {showSettings && (
+          <motion.div
+            initial={{ y: "100%" }} animate={{ y: 0 }} exit={{ y: "100%" }}
+            transition={{ type: "spring", stiffness: 300, damping: 30 }}
+            className="absolute bottom-0 left-0 right-0 z-50 rounded-t-3xl p-5 flex flex-col gap-4"
+            style={{ background: "#0f1f35", border: "1px solid rgba(34,197,94,0.15)" }}
+          >
+            <div className="flex items-center justify-between">
+              <span className="text-white font-bold text-sm">Pengaturan ComHub</span>
+              <button onClick={() => setShowSettings(false)}>
+                <X size={18} color="rgba(255,255,255,0.5)" />
+              </button>
+            </div>
+            <div className="p-3 rounded-xl text-xs text-white/50 leading-relaxed"
+              style={{ background: "rgba(34,197,94,0.06)", border: "1px solid rgba(34,197,94,0.12)" }}>
+              ComHub berjalan dengan data Hot51 — tidak perlu login.<br />
+              Untuk menggunakan akun ComHub asli, set env <span className="font-mono text-green-400">COMHUB_AUTH_TOKEN</span> di Replit Secrets.
+            </div>
+            <button onClick={() => { setShowSettings(false); fetchRooms(); }}
+              className="w-full py-2.5 rounded-xl font-bold text-sm text-white"
+              style={{ background: "rgba(34,197,94,0.7)" }}>
+              Muat Ulang Siaran
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Feed */}
       <div
