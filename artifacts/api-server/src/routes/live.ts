@@ -2375,6 +2375,55 @@ const JAV_VIDEOS = [
   { id: 59080, code: "MIDV-806", title: "MIDV-806", studio: "MOODYZ" },
 ];
 
+/** GET /api/jav/stream — try to extract HLS URL from jable.tv video page */
+liveRouter.get("/jav/stream", async (req: Request, res: Response) => {
+  const code = String(req.query.code ?? "").trim();
+  if (!code) { res.status(400).json({ error: "Missing ?code" }); return; }
+
+  try {
+    const pageUrl = `https://jable.tv/videos/${code.toLowerCase()}/`;
+    const r = await undiciFetch(pageUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.120 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Ch-Ua": '"Chromium";v="148", "Android WebView";v="148"',
+        "Sec-Ch-Ua-Mobile": "?1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!r.ok) {
+      res.json({ hlsUrl: null, iframeUrl: pageUrl, reason: `HTTP ${r.status}` });
+      return;
+    }
+
+    const html = await r.text();
+    // Extract HLS URL from JavaScript variables on the page
+    const patterns = [
+      /var\s+hlsUrl\s*=\s*['"]([^'"]+mushroomtrack[^'"]+\.m3u8[^'"]*)['"]/,
+      /hlsUrl\s*:\s*['"]([^'"]+mushroomtrack[^'"]+\.m3u8[^'"]*)['"]/,
+      /source\s*:\s*['"]([^'"]+mushroomtrack[^'"]+\.m3u8[^'"]*)['"]/,
+      /['"]([^'"]+asf-doc\.mushroomtrack\.com[^'"]+\.m3u8[^'"]*)['"]/,
+    ];
+
+    let hlsUrl: string | null = null;
+    for (const pat of patterns) {
+      const m = html.match(pat);
+      if (m?.[1]) { hlsUrl = m[1]; break; }
+    }
+
+    res.json({ hlsUrl, iframeUrl: pageUrl });
+  } catch (e) {
+    res.json({ hlsUrl: null, reason: String(e) });
+  }
+});
+
 liveRouter.get("/jav", (_req: Request, res: Response) => {
   res.setHeader("Cache-Control", "public, max-age=300, s-maxage=300");
   const videos = JAV_VIDEOS.map(v => ({

@@ -3,6 +3,7 @@ import { Switch, Route, useLocation } from "wouter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "@/components/ui/toaster";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { DataSaverProvider } from "./lib/dataSaver";
 import { AnimatePresence, motion } from "framer-motion";
 
 import BottomNav from "./components/BottomNav";
@@ -55,8 +56,10 @@ function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <AppContent />
-        <Toaster />
+        <DataSaverProvider>
+          <AppContent />
+          <Toaster />
+        </DataSaverProvider>
       </TooltipProvider>
     </QueryClientProvider>
   );
