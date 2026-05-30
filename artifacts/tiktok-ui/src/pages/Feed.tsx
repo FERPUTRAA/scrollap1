@@ -115,7 +115,7 @@ export default function Feed() {
     setStatus("loading");
     setIsGeoBlocked(false);
     try {
-      const res = await fetch(`${BASE}/api/live-rooms?limit=30`);
+      const res = await fetch(`${BASE}/api/live-rooms?limit=50`);
       const data: ApiResponse = await res.json();
 
       if (data.success && data.rooms && data.rooms.length > 0) {
@@ -187,7 +187,7 @@ export default function Feed() {
     // hlsUrl / streamUrl before the token goes stale.
     const iv = setInterval(async () => {
       try {
-        const res = await fetch(`${BASE}/api/live-rooms?limit=30`);
+        const res = await fetch(`${BASE}/api/live-rooms?limit=50`);
         const data: ApiResponse = await res.json();
         if (data.success && data.rooms && data.rooms.length > 0) {
           setTotal(data.total ?? data.rooms.length);

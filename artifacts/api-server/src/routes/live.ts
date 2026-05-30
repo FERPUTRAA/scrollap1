@@ -597,15 +597,30 @@ function unwrapHot51(data: unknown): unknown {
 
 /** Fetch anchor IDs from the working GET /lids endpoint (no auth required) */
 async function fetchAnchorIds(area = "ID", pageSize = 100): Promise<Array<{ aid: string; area: string }>> {
-  const url = withTimestamp(
-    `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterLids}?labelId=1&merchantId=${MERCHANT_ID}&memArea=${area}&pageSize=${pageSize}`
-  );
-  const raw = await hotFetch(url, { method: "GET", headers: getGuestGetHeaders(), timeoutMs: 15_000 });
-  const data = unwrapHot51(raw);
-  if (Array.isArray(data)) {
-    return (data as Array<{ aid: string; area: string }>).filter(x => x.aid);
+  // Try multiple lids endpoints — no labelId filter to get ALL live rooms, not just featured
+  const endpoints = [
+    // scrolliv liveCenterLids — no labelId to get all rooms
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterLids}?merchantId=${MERCHANT_ID}&memArea=${area}&pageSize=${pageSize}`,
+    // scrolliv with labelId=0 (all categories)
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterLids}?labelId=0&merchantId=${MERCHANT_ID}&memArea=${area}&pageSize=${pageSize}`,
+    // v4 liveHomePageLids — alternate lids endpoint
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveHomePageLids}?merchantId=${MERCHANT_ID}&memArea=${area}&pageSize=${pageSize}`,
+    // scrolliv page 2 for more rooms
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterLids}?merchantId=${MERCHANT_ID}&memArea=${area}&pageSize=${pageSize}&pageNum=2`,
+  ];
+
+  const allAids = new Map<string, { aid: string; area: string }>();
+  for (const ep of endpoints) {
+    try {
+      const raw = await hotFetch(withTimestamp(ep), { method: "GET", headers: getGuestGetHeaders(), timeoutMs: 12_000 });
+      const data = unwrapHot51(raw);
+      const list = Array.isArray(data) ? data : (data as Record<string, unknown>)?.list as unknown[] ?? [];
+      for (const item of (Array.isArray(list) ? list : []) as Array<{ aid: string; area: string }>) {
+        if (item?.aid && !allAids.has(item.aid)) allAids.set(item.aid, { aid: item.aid, area: area });
+      }
+    } catch { continue; }
   }
-  return [];
+  return Array.from(allAids.values());
 }
 
 /** Fetch cover URLs for a batch of anchor IDs using swipeSwitch */
@@ -788,14 +803,21 @@ async function fetchLiveRooms(): Promise<{ rooms: ProcessedRoom[]; total: number
   let total = 0;
 
   // STRATEGY 1 (primary — confirmed working, no auth required):
-  // GET /lids → anchor IDs, enrich with cover URLs (swipeSwitch) + room metadata (room-info)
+  // GET /lids → anchor IDs from multiple areas, enrich with covers + room metadata (room-info)
   try {
-    const [idListID, idListVN] = await Promise.all([
-      fetchAnchorIds("ID", 80).catch(() => []),
-      fetchAnchorIds("VN", 40).catch(() => []),
+    const [idListID, idListVN, idListPH, idListSG] = await Promise.all([
+      fetchAnchorIds("ID", 100).catch(() => []),
+      fetchAnchorIds("VN", 50).catch(() => []),
+      fetchAnchorIds("PH", 30).catch(() => []),
+      fetchAnchorIds("SG", 20).catch(() => []),
     ]);
 
-    const allAnchors = [...idListID, ...idListVN];
+    // Deduplicate by aid
+    const seenAids = new Set<string>();
+    const allAnchors: Array<{ aid: string; area: string }> = [];
+    for (const item of [...idListID, ...idListVN, ...idListPH, ...idListSG]) {
+      if (!seenAids.has(item.aid)) { seenAids.add(item.aid); allAnchors.push(item); }
+    }
 
     if (allAnchors.length > 0) {
       // Build base records
@@ -809,10 +831,10 @@ async function fetchLiveRooms(): Promise<{ rooms: ProcessedRoom[]; total: number
         onlineCount: 0,
       }));
 
-      // Parallel: get covers (swipeSwitch) + enrich first 30 with room-info
+      // Parallel: get covers (swipeSwitch) + enrich up to 60 rooms with room-info for real stream URLs
       const [coverMap, enrichedRecords] = await Promise.all([
         buildCoverMap(allAnchors.map(a => a.aid)).catch(() => new Map<string, string>()),
-        enrichRooms(baseRecords, 30).catch(() => baseRecords),
+        enrichRooms(baseRecords, 60).catch(() => baseRecords),
       ]);
 
       // Apply cover map to all records
@@ -823,22 +845,23 @@ async function fetchLiveRooms(): Promise<{ rooms: ProcessedRoom[]; total: number
       total = records.length;
     }
   } catch {
-    // fall through to legacy POST endpoints
+    // fall through to POST endpoints
   }
 
-  // STRATEGY 2 (fallback — POST endpoints, may need auth for some):
-  if (records.length === 0 && session) {
-    const roomListEndpoints = [
-      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.homeLives}`,      body: JSON.stringify({ area: "ID", page: 1, pageSize: 200 }) },
-      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterList}`, body: JSON.stringify({ area: "ID", page: 1, pageSize: 200 }) },
-      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.getHotLiveList}`, body: JSON.stringify({ area: "ID", page: 1, pageSize: 200 }) },
-    ];
+  // STRATEGY 2 (fallback — POST endpoints, work with Basic auth, no user login required):
+  if (records.length === 0) {
+    const areas = session ? ["ID", "VN", "PH"] : ["ID"];
+    const roomListEndpoints = areas.flatMap(area => [
+      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.homeLives}`,      body: JSON.stringify({ area, page: 1, pageSize: 100 }) },
+      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterList}`, body: JSON.stringify({ area, page: 1, pageSize: 100 }) },
+      { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.getHotLiveList}`, body: JSON.stringify({ area, page: 1, pageSize: 100 }) },
+    ]);
 
     for (const ep of roomListEndpoints) {
       try {
         const data = await hotFetch(withTimestamp(ep.url), {
           method: "POST",
-          headers: getUserHeaders(),
+          headers: getPostHeaders(ep.body),
           body: ep.body,
           timeoutMs: 20_000,
         });
@@ -1002,7 +1025,7 @@ liveRouter.post("/hot51-proxy", async (req: Request, res: Response) => {
 });
 
 liveRouter.get("/live-rooms", async (req: Request, res: Response) => {
-  const limit = Math.min(100, Math.max(1, parseInt(String(req.query.limit ?? "30"), 10)));
+  const limit = Math.min(200, Math.max(1, parseInt(String(req.query.limit ?? "50"), 10)));
   const offset = Math.max(0, parseInt(String(req.query.offset ?? "0"), 10));
 
   try {
