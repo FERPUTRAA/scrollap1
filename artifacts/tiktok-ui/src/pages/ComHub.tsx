@@ -12,7 +12,7 @@ interface LiveRoom {
   avatar: string;
   coverUrl: string;
   viewerCount: number;
-  streamId: string;   // May contain HLS URL for Hot51 fallback rooms
+  streamId: string;
   title: string;
   countryCode: string;
 }
@@ -28,7 +28,7 @@ interface StreamInfo {
   rtmpUrl?: string;
 }
 
-type ListStatus = "loading" | "ok" | "error" | "empty";
+type ListStatus = "loading" | "ok" | "error" | "empty" | "noAuth";
 
 // ── Room Card ──────────────────────────────────────────────────────
 function RoomCard({ room, isActive }: { room: LiveRoom; isActive: boolean }) {
@@ -268,6 +268,11 @@ export default function ComHub() {
         rooms?: LiveRoom[];
       };
 
+      if (data.noAuth) {
+        setErrorMsg(data.error ?? "Token ComHub diperlukan");
+        setListStatus("noAuth");
+        return;
+      }
       if (!data.success || !data.rooms?.length) {
         setErrorMsg(data.error ?? "Belum ada siaran live saat ini");
         setListStatus(data.rooms?.length === 0 ? "empty" : "error");
@@ -303,6 +308,35 @@ export default function ComHub() {
       <div className="flex flex-col items-center justify-center h-full gap-4" style={{ background: "#0a1628" }}>
         <div className="w-12 h-12 rounded-full border-4 border-white/20 border-t-green-400 animate-spin" />
         <p className="text-white/60 text-sm">Memuat siaran live Indonesia…</p>
+      </div>
+    );
+  }
+
+  // ── No Auth ───────────────────────────────────────────────────────
+  if (listStatus === "noAuth") {
+    return (
+      <div className="flex flex-col items-center justify-center h-full gap-5 px-8" style={{ background: "#0a1628" }}>
+        <div className="w-14 h-14 rounded-2xl flex items-center justify-center"
+          style={{ background: "rgba(34,197,94,0.15)", border: "1px solid rgba(34,197,94,0.3)" }}>
+          <Settings size={26} color="rgba(34,197,94,0.8)" />
+        </div>
+        <div className="text-center">
+          <p className="text-white font-bold text-base mb-1">Login ComHub Diperlukan</p>
+          <p className="text-white/50 text-sm leading-relaxed">{errorMsg}</p>
+        </div>
+        <div className="w-full p-4 rounded-2xl text-xs leading-relaxed"
+          style={{ background: "rgba(34,197,94,0.06)", border: "1px solid rgba(34,197,94,0.15)" }}>
+          <p className="text-green-400 font-semibold mb-2">Cara setup:</p>
+          <p className="text-white/50">1. Buka <span className="font-mono text-green-300">Replit Secrets</span></p>
+          <p className="text-white/50">2. Set <span className="font-mono text-green-300">COMHUB_AUTH_TOKEN</span></p>
+          <p className="text-white/50">3. Set <span className="font-mono text-green-300">COMHUB_USER_ID</span></p>
+          <p className="text-white/50">4. Restart server</p>
+        </div>
+        <button onClick={fetchRooms}
+          className="px-5 py-2.5 rounded-full text-white font-bold text-sm flex items-center gap-2"
+          style={{ background: "rgba(34,197,94,0.8)" }}>
+          <RefreshCw size={13} />Cek Ulang
+        </button>
       </div>
     );
   }
@@ -381,8 +415,8 @@ export default function ComHub() {
             </div>
             <div className="p-3 rounded-xl text-xs text-white/50 leading-relaxed"
               style={{ background: "rgba(34,197,94,0.06)", border: "1px solid rgba(34,197,94,0.12)" }}>
-              ComHub berjalan dengan data Hot51 — tidak perlu login.<br />
-              Untuk menggunakan akun ComHub asli, set env <span className="font-mono text-green-400">COMHUB_AUTH_TOKEN</span> di Replit Secrets.
+              ComHub memerlukan akun untuk menampilkan siaran live.<br />
+              Set env <span className="font-mono text-green-400">COMHUB_AUTH_TOKEN</span> dan <span className="font-mono text-green-400">COMHUB_USER_ID</span> di Replit Secrets.
             </div>
             <button onClick={() => { setShowSettings(false); fetchRooms(); }}
               className="w-full py-2.5 rounded-xl font-bold text-sm text-white"
