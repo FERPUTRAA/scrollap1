@@ -2023,61 +2023,103 @@ liveRouter.get("/cdn-test", async (req: Request, res: Response) => {
 
 /** GET /api/gifts — daftar gift dari HOT51 */
 liveRouter.get("/gifts", async (_req: Request, res: Response) => {
-  const endpoints = [
-    `${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList}`,
-    `${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList2}`,
-    `${HOT51_BASE}/${MERCHANT_ID}/api${API.getPackageGiftList}`,
+  // Gift list endpoints — try GET first (as seen in APK traffic capture), then POST fallback
+  const getEndpoints = [
+    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList}?merchantId=${MERCHANT_ID}`),
+    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList2}?merchantId=${MERCHANT_ID}`),
+    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getPackageGiftList}?merchantId=${MERCHANT_ID}`),
   ];
-  for (const url of endpoints) {
+  for (const url of getEndpoints) {
     try {
-      const data = await hotFetch(url, { method: "POST", headers: getUserHeaders(), body: JSON.stringify({}), timeoutMs: 8_000 });
-      if (data && typeof data === "object") {
-        const d = data as Record<string, unknown>;
-        if (d.data || d.records || d.list) {
-          res.json({ success: true, data });
+      const raw = await hotFetch(url, { method: "GET", headers: getGuestGetHeaders(), timeoutMs: 10_000 });
+      const d = raw as Record<string, unknown>;
+      if (d?.code === 200 || d?.code === "200") {
+        const inner = d.data;
+        // Normalize: extract list from various response shapes
+        const list = Array.isArray(inner) ? inner
+          : Array.isArray((inner as Record<string, unknown>)?.list) ? (inner as Record<string, unknown>).list
+          : Array.isArray((inner as Record<string, unknown>)?.records) ? (inner as Record<string, unknown>).records
+          : null;
+        if (list && (list as unknown[]).length > 0) {
+          res.json({ success: true, data: raw, list });
           return;
         }
       }
     } catch { continue; }
   }
-  res.json({ success: false, error: "Tidak bisa memuat daftar gift", data: null });
-});
-
-/** POST /api/send-gift — kirim gift ke anchor { anchorId, liveId, giftId, giftNum } */
-liveRouter.post("/send-gift", async (req: Request, res: Response) => {
-  if (!session) {
-    res.status(401).json({ success: false, error: "Perlu login dulu — set HOT51_AC + HOT51_SIGN di Secrets" });
-    return;
-  }
-  const { anchorId, liveId, giftId, giftNum = 1 } = req.body ?? {};
-  if (!anchorId || !liveId || !giftId) {
-    res.status(400).json({ success: false, error: "Perlu anchorId, liveId, dan giftId" });
-    return;
-  }
-  const endpoints = [
-    { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.sendGift}`, body: JSON.stringify({ anchorId, liveId, giftId, giftNum }) },
-    { url: `${HOT51_BASE}/${MERCHANT_ID}/api${API.sendPackageGift}`, body: JSON.stringify({ anchorId, liveId, giftId, giftNum }) },
+  // Fallback: try POST
+  const postEndpoints = [
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList}`,
+    `${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList2}`,
   ];
-  const { anchorId: aId, liveId: lId, giftId: gId, giftNum: gNum = 1 } = req.body ?? {};
-  for (const ep of endpoints) {
+  for (const url of postEndpoints) {
     try {
-      const data = await hotFetch(ep.url, { method: "POST", headers: getUserHeaders(), body: ep.body, timeoutMs: 8_000 });
-      if (data && typeof data === "object") {
-        // Broadcast gift event to all SSE clients for this room
-        const d = data as Record<string, unknown>;
-        const giftName = (d.giftName as string) || (d.name as string) || `Gift#${gId}`;
-        broadcastRoom(String(aId), "gift", {
-          nickname: session?.username ?? "Saya",
-          giftName,
-          giftNum: Number(gNum),
-          giftId: gId,
-        });
-        res.json({ success: true, data });
+      const raw = await hotFetch(withTimestamp(url), { method: "POST", headers: getPostHeaders("{}"), body: "{}", timeoutMs: 8_000 });
+      const d = raw as Record<string, unknown>;
+      const inner = d?.data ?? d;
+      const list = Array.isArray(inner) ? inner
+        : Array.isArray((inner as Record<string, unknown>)?.list) ? (inner as Record<string, unknown>).list
+        : null;
+      if (list && (list as unknown[]).length > 0) {
+        res.json({ success: true, data: raw, list });
         return;
       }
     } catch { continue; }
   }
-  res.json({ success: false, error: "Gagal mengirim gift" });
+  res.json({ success: false, error: "Tidak bisa memuat daftar gift", data: null, list: null });
+});
+
+/** POST /api/send-gift — kirim gift ke anchor { anchorId, liveId, giftId, giftNum, giftName? } */
+liveRouter.post("/send-gift", async (req: Request, res: Response) => {
+  const { anchorId, liveId, giftId, giftNum = 1, giftName: clientGiftName } = req.body ?? {};
+  if (!anchorId || !liveId || !giftId) {
+    res.status(400).json({ success: false, error: "Perlu anchorId, liveId, dan giftId" });
+    return;
+  }
+
+  const num = Number(giftNum) || 1;
+  const bodyObj = { anchorId, liveId, giftId, giftNum: num, merchantId: Number(MERCHANT_ID) };
+  const bodyStr = JSON.stringify(bodyObj);
+
+  const endpoints = [
+    { url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.sendGift}`),        body: bodyStr },
+    { url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.sendPackageGift}`), body: JSON.stringify({ ...bodyObj, packageId: giftId }) },
+  ];
+
+  for (const ep of endpoints) {
+    try {
+      const data = await hotFetch(ep.url, {
+        method: "POST",
+        headers: getPostHeaders(ep.body),
+        body: ep.body,
+        timeoutMs: 10_000,
+      });
+      const d = data as Record<string, unknown>;
+      const code = Number(d?.code ?? d?.status ?? 0);
+      if (code === 200 || d?.success === true) {
+        const resolvedName = (d.giftName as string) || (d.name as string) || clientGiftName || `Gift#${giftId}`;
+        broadcastRoom(String(anchorId), "gift", {
+          nickname: session?.username ?? "Saya",
+          giftName: resolvedName,
+          giftNum: num,
+          giftId,
+        });
+        res.json({ success: true, data });
+        return;
+      }
+      // API responded but with error code — report it clearly
+      if (code > 0 && code !== 200) {
+        const msg = (d.msg as string) || (d.message as string) || (d.error as string) || `API code ${code}`;
+        res.json({ success: false, error: msg, code, needsAuth: code === 401 || code === 403 || String(d.msg).toLowerCase().includes("login") });
+        return;
+      }
+    } catch { continue; }
+  }
+  res.json({
+    success: false,
+    error: session ? "Gagal mengirim gift — pastikan koin mencukupi" : "Perlu login akun HOT51 (set HOT51_AC + HOT51_SIGN di Secrets)",
+    needsAuth: !session,
+  });
 });
 
 /** GET /api/server-config — konfigurasi merchant dari HOT51 */
@@ -2305,31 +2347,55 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
 
   const lvl = Math.max(1, Math.min(4, Number(level) || 1));
   const bt  = Math.max(1, Math.min(10, Number(duration) || 3));
+  const levelName = ["", "Low", "Mid", "High", "Super"][lvl];
 
-  // Try Hot51 toy interaction API
-  const toyUrl = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/interact`);
-  const body   = JSON.stringify({ anchorId, liveId, level: lvl, baubleTime: bt });
+  // Try multiple Hot51 toy/vibrator API paths (from APK smali decompile)
+  const bodyObj = { anchorId, liveId, level: lvl, baubleTime: bt, merchantId: Number(MERCHANT_ID) };
+  const bodyStr = JSON.stringify(bodyObj);
 
-  try {
-    const data = await hotFetch(toyUrl, {
-      method: "POST",
-      headers: getPostHeaders(body),
-      body,
-      timeoutMs: 8_000,
-    });
-    const d = data as Record<string, unknown>;
-    // Broadcast lovense event to all SSE clients for this room
-    broadcastRoom(anchorId, "lovense", { nickname: "Penonton", level: ["", "Low", "Mid", "High", "Super"][lvl], duration: bt });
-    res.json({ success: true, data: d });
-  } catch (err) {
-    // Even if API fails, broadcast locally and return note
-    broadcastRoom(anchorId, "lovense", { nickname: "Penonton", level: ["", "Low", "Mid", "High", "Super"][lvl], duration: bt });
-    res.json({
-      success: false,
-      note: "Fitur toy memerlukan akun Hot51 yang terautentikasi",
-      error: String(err),
-    });
+  const toyEndpoints = [
+    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/interact`),
+    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/zbliv/toy/interact`),
+    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/live/toy/interact`),
+  ];
+
+  for (const toyUrl of toyEndpoints) {
+    try {
+      const data = await hotFetch(toyUrl, {
+        method: "POST",
+        headers: getPostHeaders(bodyStr),
+        body: bodyStr,
+        timeoutMs: 8_000,
+      });
+      const d = data as Record<string, unknown>;
+      const code = Number(d?.code ?? d?.status ?? 0);
+      if (code === 200 || d?.success === true) {
+        // Real API success — broadcast to SSE clients
+        broadcastRoom(anchorId, "lovense", { nickname: session?.username ?? "Penonton", level: levelName, duration: bt, real: true });
+        res.json({ success: true, data: d, level: levelName, duration: bt });
+        return;
+      }
+      if (code > 0 && code !== 200) {
+        const msg = (d.msg as string) || (d.message as string) || `API code ${code}`;
+        res.json({
+          success: false,
+          error: msg,
+          code,
+          needsAuth: code === 401 || code === 403 || String(d.msg).toLowerCase().includes("login"),
+        });
+        return;
+      }
+    } catch { continue; }
   }
+
+  // All endpoints failed — report honestly, do NOT fake local broadcast
+  res.json({
+    success: false,
+    error: session
+      ? "Toy interact gagal — host mungkin tidak punya Lovense yang terhubung"
+      : "Perlu login akun HOT51 (set HOT51_AC + HOT51_SIGN di Secrets)",
+    needsAuth: !session,
+  });
 });
 
 /** POST /api/send-comment — kirim komentar ke live stream */

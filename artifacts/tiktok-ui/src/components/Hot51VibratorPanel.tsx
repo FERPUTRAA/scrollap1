@@ -1,6 +1,6 @@
 import React, { useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Zap } from "lucide-react";
+import { X, Zap, Lock, CheckCircle, AlertCircle } from "lucide-react";
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 
@@ -20,6 +20,13 @@ const LEVELS: VibratorLevel[] = [
   { id: 4, label: "Super", icon: "💥", color: "#EE1D52", shadow: "#EE1D5244", duration: 7 },
 ];
 
+interface ResultState {
+  ok: boolean;
+  msg: string;
+  needsAuth?: boolean;
+  real?: boolean;
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -33,7 +40,7 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
   const [selected, setSelected] = useState<VibratorLevel>(LEVELS[0]);
   const [duration, setDuration] = useState(3);
   const [sending, setSending] = useState(false);
-  const [lastResult, setLastResult] = useState<string | null>(null);
+  const [result, setResult] = useState<ResultState | null>(null);
 
   const hapticFeedback = useCallback((level: number, dur: number) => {
     if (!("vibrate" in navigator)) return;
@@ -53,8 +60,7 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
   const handleSend = useCallback(async () => {
     if (sending) return;
     setSending(true);
-    setLastResult(null);
-    hapticFeedback(selected.id, duration);
+    setResult(null);
 
     try {
       const res = await fetch(`${BASE}/api/toy-interact`, {
@@ -62,20 +68,30 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ anchorId, liveId, level: selected.id, duration }),
       });
-      const data = await res.json() as { success: boolean; error?: string; note?: string };
+      const data = await res.json() as {
+        success: boolean;
+        error?: string;
+        note?: string;
+        needsAuth?: boolean;
+        level?: string;
+        duration?: number;
+      };
+
       if (data.success) {
-        setLastResult(`✅ Lovense ${selected.label} dikirim ${duration}s`);
-        onChatMsg?.(`💥 Kamu memicu Lovense ${selected.label} bergetar ${duration}s untuk ${streamerName}`);
+        // Real API success — also trigger device haptic
+        hapticFeedback(selected.id, duration);
+        setResult({ ok: true, msg: `✅ Lovense ${data.level ?? selected.label} aktif ${data.duration ?? duration}s`, real: true });
+        onChatMsg?.(`💥 Lovense ${selected.label} bergetar ${duration}s untuk ${streamerName}`);
+      } else if (data.needsAuth) {
+        setResult({ ok: false, msg: "🔒 Perlu login HOT51 (set HOT51_AC + HOT51_SIGN di Secrets)", needsAuth: true });
       } else {
-        setLastResult(`⚠️ ${data.error ?? data.note ?? "Perlu login"}`);
-        onChatMsg?.(`〰️ Lovense ${selected.label} (${duration}s) — perlu akun Hot51`);
+        setResult({ ok: false, msg: data.error ?? data.note ?? "Gagal — host mungkin tidak punya Lovense" });
       }
     } catch {
-      setLastResult("📳 Efek getaran di perangkatmu aktif!");
-      onChatMsg?.(`〰️ Lovense ${selected.label} (${duration}s)`);
+      setResult({ ok: false, msg: "Koneksi ke server gagal" });
     } finally {
       setSending(false);
-      setTimeout(() => setLastResult(null), 3000);
+      setTimeout(() => setResult(null), 4000);
     }
   }, [sending, selected, duration, anchorId, liveId, streamerName, onChatMsg, hapticFeedback]);
 
@@ -121,7 +137,7 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
                     onClick={() => { setSelected(lv); setDuration(lv.duration); }}
                     className="flex flex-col items-center gap-1.5 py-3 rounded-xl transition-all"
                     style={{
-                      background: selected.id === lv.id ? `${lv.shadow}` : "rgba(255,255,255,0.04)",
+                      background: selected.id === lv.id ? lv.shadow : "rgba(255,255,255,0.04)",
                       border: `2px solid ${selected.id === lv.id ? lv.color : "transparent"}`,
                       boxShadow: selected.id === lv.id ? `0 0 16px ${lv.shadow}` : "none",
                     }}
@@ -135,7 +151,9 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
               </div>
 
               {/* Duration slider */}
-              <p className="text-white/40 text-[10px] uppercase tracking-widest mb-2">Durasi: <span className="text-white font-bold">{duration}s</span></p>
+              <p className="text-white/40 text-[10px] uppercase tracking-widest mb-2">
+                Durasi: <span className="text-white font-bold">{duration}s</span>
+              </p>
               <div className="relative mb-4">
                 <input
                   type="range"
@@ -173,23 +191,42 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
                 )}
               </motion.button>
 
-              {/* Result */}
+              {/* Result feedback */}
               <AnimatePresence>
-                {lastResult && (
-                  <motion.p
+                {result && (
+                  <motion.div
                     initial={{ opacity: 0, y: 6 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0 }}
-                    className="text-center text-xs mt-2"
-                    style={{ color: "rgba(255,255,255,0.6)" }}
+                    className="mt-2 px-3 py-2 rounded-xl flex items-center gap-2"
+                    style={{
+                      background: result.ok
+                        ? "rgba(34,197,94,0.12)"
+                        : result.needsAuth
+                          ? "rgba(255,215,0,0.10)"
+                          : "rgba(238,29,82,0.12)",
+                      border: `1px solid ${result.ok ? "rgba(34,197,94,0.3)" : result.needsAuth ? "rgba(255,215,0,0.3)" : "rgba(238,29,82,0.3)"}`,
+                    }}
                   >
-                    {lastResult}
-                  </motion.p>
+                    {result.ok ? (
+                      <CheckCircle size={13} color="#22c55e" />
+                    ) : result.needsAuth ? (
+                      <Lock size={13} color="#FFD700" />
+                    ) : (
+                      <AlertCircle size={13} color="#EE1D52" />
+                    )}
+                    <span
+                      className="text-xs leading-snug"
+                      style={{ color: result.ok ? "#86efac" : result.needsAuth ? "#fde68a" : "#fca5a5" }}
+                    >
+                      {result.msg}
+                    </span>
+                  </motion.div>
                 )}
               </AnimatePresence>
 
               <p className="text-white/20 text-[9px] text-center mt-3">
-                Lovense toy terhubung ke host live • Efek haptic di perangkatmu aktif
+                Mengirim sinyal ke Lovense host • Memerlukan akun HOT51 login
               </p>
             </div>
           </motion.div>
