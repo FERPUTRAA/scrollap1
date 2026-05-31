@@ -214,9 +214,9 @@ const BASE_HEADERS: Record<string, string> = {
   "client-type": "1",
   "dev-type": "android_realme_RMX2030",
   "system-version": "10",
-  versionCode: "590",
+  versionCode: "593",
   "time-zone": "GMT+07:00",
-  "User-Agent": "Cronet/590 (Linux; U; Android 10; en; RMX2030; Build/QKQ1.200209.002; Cronet/119.0.6045.31)",
+  "User-Agent": "Cronet/593 (Linux; U; Android 10; en; RMX2030; Build/QKQ1.200209.002; Cronet/119.0.6045.31)",
   Accept: "*/*",
   Connection: "keep-alive",
 };
@@ -232,12 +232,14 @@ const APP_HEADERS: Record<string, string> = { ...BASE_HEADERS };
 const SIGN_EMPTY_BODY      = "11f569ed792da4e0cff8a393534a5bf2"; // empty / form-urlencoded
 const SIGN_LIVE_NEXT       = "c01ca7f79119440f05281127fda04637"; // scrolliv/live/next body type
 const SIGN_ROOM_INFO       = "1867b90749947a889f6523f9097a70c2"; // room-info body type
+const SIGN_TOY_SEND        = "08c4e7c3bda811740bf8d087b3fcbcf6"; // toy/send body (versionCode 593)
 
 /** Pick captured sign for the given JSON body (best-effort — may differ per dynamic ID) */
 function signForBody(body: string): string {
   if (!body || body === "{}") return SIGN_EMPTY_BODY;
   if (body.startsWith('{"aid"')) return SIGN_LIVE_NEXT;
   if (body.startsWith('{"anchorId"')) return SIGN_ROOM_INFO;
+  if (body.startsWith('{"toyId"')) return SIGN_TOY_SEND;
   return SIGN_EMPTY_BODY; // fallback
 }
 
@@ -2469,15 +2471,15 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
   const reqTime  = Math.max(0, Math.min(420, Number(baubleTime) || 0)); // cap 7 menit
   const memberId = session?.memberId ?? null;
 
-  /** Build one POST body, optionally injecting baubleTime override */
+  /** Build one POST body — field order matches APK traffic exactly: toyId,memberId,anchorId,area,toyNum */
   const makeBody = (bt?: number): string => {
     const obj: Record<string, unknown> = {
       toyId: String(toyId),
-      anchorId,
-      area: session?.area ?? "ID",
-      toyNum: num,
     };
-    if (memberId) obj.memberId = Number(memberId);
+    if (memberId) obj.memberId = Number(memberId); // memberId as number, second field
+    obj.anchorId = anchorId;
+    obj.area = session?.area ?? "ID";
+    obj.toyNum = num;
     if (bt && bt > 0) obj.baubleTime = bt; // attempt server-side override
     return JSON.stringify(obj);
   };
