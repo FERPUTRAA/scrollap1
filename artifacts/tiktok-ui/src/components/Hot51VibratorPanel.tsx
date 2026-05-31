@@ -13,6 +13,19 @@ interface Toy {
   toyPriceStr?: string;
 }
 
+const FALLBACK_TOYS: Toy[] = [
+  { id: 1,     toyName: "Lovense1",  toyPrice: 5000,    baubleTime: 5,   baubleGrade: 0 },
+  { id: 3,     toyName: "Lovense10", toyPrice: 7000,    baubleTime: 10,  baubleGrade: 0 },
+  { id: 30001, toyName: "Lovense2",  toyPrice: 20000,   baubleTime: 10,  baubleGrade: 1 },
+  { id: 60001, toyName: "Lovense3",  toyPrice: 25000,   baubleTime: 20,  baubleGrade: 1 },
+  { id: 2,     toyName: "Lovense6",  toyPrice: 50000,   baubleTime: 10,  baubleGrade: 2 },
+  { id: 60003, toyName: "Lovense",   toyPrice: 150000,  baubleTime: 15,  baubleGrade: 3 },
+  { id: 60002, toyName: "Lovense4",  toyPrice: 150000,  baubleTime: 30,  baubleGrade: 2 },
+  { id: 30002, toyName: "Lovense5",  toyPrice: 250000,  baubleTime: 30,  baubleGrade: 3 },
+  { id: 60004, toyName: "Lovense8",  toyPrice: 500000,  baubleTime: 60,  baubleGrade: 3 },
+  { id: 30003, toyName: "Lovense9",  toyPrice: 1250000, baubleTime: 300, baubleGrade: 3 },
+];
+
 const GRADE_COLOR = ["#69C9D0", "#22c55e", "#FF8C00", "#EE1D52"];
 const GRADE_ICON  = ["〰️", "〽️", "⚡", "💥"];
 
@@ -53,8 +66,11 @@ export default function Hot51VibratorPanel({
   const fetchToys = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5_000);
     try {
-      const res = await fetch(`${BASE}/api/toys`);
+      const res = await fetch(`${BASE}/api/toys`, { signal: controller.signal });
+      clearTimeout(timer);
       const data = await res.json() as { success: boolean; data?: unknown; error?: string };
       if (data.success) {
         const raw = data.data;
@@ -64,13 +80,18 @@ export default function Hot51VibratorPanel({
             ? ((raw as Record<string, unknown>).list as Toy[])
             : [];
         list.sort((a, b) => (a.toyPrice ?? 0) - (b.toyPrice ?? 0));
-        setToys(list);
-        if (list.length > 0) setSelected(list[0]);
+        const final = list.length > 0 ? list : FALLBACK_TOYS;
+        setToys(final);
+        setSelected(final[0]);
       } else {
-        setLoadError(data.error ?? "Gagal memuat daftar toy");
+        setToys(FALLBACK_TOYS);
+        setSelected(FALLBACK_TOYS[0]);
       }
     } catch {
-      setLoadError("Koneksi ke server gagal");
+      clearTimeout(timer);
+      // Timeout atau network error — pakai fallback supaya panel tidak stuck
+      setToys(FALLBACK_TOYS);
+      setSelected(FALLBACK_TOYS[0]);
     } finally {
       setLoading(false);
     }
@@ -78,7 +99,7 @@ export default function Hot51VibratorPanel({
 
   useEffect(() => {
     if (open && toys.length === 0 && !loading) fetchToys();
-  }, [open]);
+  }, [open, fetchToys]);
 
   const haptic = useCallback((dur: number) => {
     if (!("vibrate" in navigator)) return;
