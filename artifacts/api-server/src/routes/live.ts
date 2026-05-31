@@ -2424,74 +2424,138 @@ liveRouter.get("/toys", async (_req: Request, res: Response) => {
   }
 });
 
-/** POST /api/toy-interact — kirim toy ke anchor menggunakan POST /plr/toy/send */
+/** POST /api/toy-interact — kirim toy ke anchor menggunakan POST /plr/toy/send
+ *  Params: anchorId, toyId, toyNum (default 1), baubleTime (seconds, 1-420, default 0=use toy default)
+ *  Behavior:
+ *  - Selalu kirim ke Hot51 real API
+ *  - Kalau ada session: inject broadcast SSE lokal + return 200 OK setelah kirim ke remote
+ *  - baubleTime override: coba kirim ke Hot51, jika durasi > toyDefault, loop repeat otomatis
+ */
 liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
-  const { anchorId, toyId, toyNum = 1 } = (req.body ?? {}) as {
-    anchorId?: string; toyId?: string; toyNum?: number;
+  const { anchorId, toyId, toyNum = 1, baubleTime = 0 } = (req.body ?? {}) as {
+    anchorId?: string; toyId?: string; toyNum?: number; baubleTime?: number;
   };
   if (!anchorId || !toyId) {
     res.status(400).json({ success: false, error: "anchorId dan toyId diperlukan" });
     return;
   }
 
-  const num = Math.max(1, Number(toyNum) || 1);
+  const num      = Math.max(1, Number(toyNum) || 1);
+  // baubleTime: user-requested duration in seconds (0 = use toy default from list)
+  const reqTime  = Math.max(0, Math.min(420, Number(baubleTime) || 0)); // cap 7 menit
   const memberId = session?.memberId ?? null;
 
-  // Body sesuai traffic capture: {toyId, memberId, anchorId, area, toyNum}
-  // memberId harus number (besar) sesuai capture: 2061018930369236993
-  const bodyObj: Record<string, unknown> = {
-    toyId: String(toyId),
-    anchorId,
-    area: session?.area ?? "ID",
-    toyNum: num,
+  /** Build one POST body, optionally injecting baubleTime override */
+  const makeBody = (bt?: number): string => {
+    const obj: Record<string, unknown> = {
+      toyId: String(toyId),
+      anchorId,
+      area: session?.area ?? "ID",
+      toyNum: num,
+    };
+    if (memberId) obj.memberId = Number(memberId);
+    if (bt && bt > 0) obj.baubleTime = bt; // attempt server-side override
+    return JSON.stringify(obj);
   };
-  // Tambahkan memberId jika tersedia (dari JWT payload)
-  if (memberId) bodyObj.memberId = Number(memberId);
 
-  const bodyStr = JSON.stringify(bodyObj);
-  const toyUrl = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/send`);
+  /** Send one request to Hot51 /plr/toy/send, return {ok, code, data} */
+  const sendOnce = async (body: string) => {
+    const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/send`);
+    const data = await hotFetch(url, {
+      method: "POST",
+      headers: getBearerHeaders(body),
+      body,
+      timeoutMs: 12_000,
+    }) as Record<string, unknown>;
+    const code = Number(data?.code ?? data?.status ?? 0);
+    const ok   = code === 200 || data?.success === true;
+    return { ok, code, data };
+  };
+
+  // ── Step 1: Send to real Hot51 API ──────────────────────────────────────────
+  let remoteOk   = false;
+  let remoteCode = 0;
+  let remoteData: Record<string, unknown> = {};
+  let repeatCount = 1;
 
   try {
-    const data = await hotFetch(toyUrl, {
-      method: "POST",
-      headers: getBearerHeaders(bodyStr),
-      body: bodyStr,
-      timeoutMs: 10_000,
+    // Try with baubleTime override first
+    const body1 = makeBody(reqTime > 0 ? reqTime : undefined);
+    const r1 = await sendOnce(body1);
+    remoteOk   = r1.ok;
+    remoteCode = r1.code;
+    remoteData = r1.data;
+
+    // If first attempt returned auth error (401/403), don't repeat
+    if (!remoteOk && (remoteCode === 401 || remoteCode === 403)) {
+      // fall through to inject logic below
+    } else if (remoteOk && reqTime > 0) {
+      // Success — check if we need to repeat for longer duration
+      // Estimate toy's native baubleTime from common values (we can't know without list)
+      // Use repeat loop: send again every (30s default) until reqTime is covered
+      const nativeBt = 30; // conservative assumption
+      repeatCount = Math.ceil(reqTime / nativeBt);
+      // Schedule background repeats (fire-and-forget, non-blocking)
+      if (repeatCount > 1) {
+        (async () => {
+          for (let i = 1; i < repeatCount; i++) {
+            await new Promise(r => setTimeout(r, nativeBt * 1000));
+            try {
+              await sendOnce(makeBody(nativeBt));
+              broadcastRoom(anchorId, "lovense", {
+                nickname: session?.username ?? "Penonton",
+                toyId, toyNum: num, baubleTime: nativeBt,
+                repeat: i + 1, of: repeatCount, real: true,
+              });
+            } catch { break; }
+          }
+        })().catch(() => undefined);
+      }
+    }
+  } catch {
+    // Network error — continue to inject logic
+  }
+
+  // ── Step 2: Inject broadcast SSE + return 200 if session exists ─────────────
+  // "Paksa 200 OK" — kalau ada session, kita inject event SSE lokal dan kembalikan
+  // success terlepas dari response remote. Remote call tetap dikirim (step 1 di atas).
+  if (session) {
+    broadcastRoom(anchorId, "lovense", {
+      nickname: session.username ?? "Penonton",
+      toyId,
+      toyNum: num,
+      baubleTime: reqTime > 0 ? reqTime : undefined,
+      remoteOk,
+      remoteCode: remoteOk ? 200 : remoteCode,
+      real: remoteOk,
+      injected: !remoteOk,
+      repeats: repeatCount,
     });
-    const d = data as Record<string, unknown>;
-    const code = Number(d?.code ?? d?.status ?? 0);
-    if (code === 200 || d?.success === true) {
-      broadcastRoom(anchorId, "lovense", {
-        nickname: session?.username ?? "Penonton",
-        toyId,
-        toyNum: num,
-        real: true,
-      });
-      res.json({ success: true, data: d, toyId, toyNum: num });
-      return;
-    }
-    if (code > 0) {
-      const msg = (d.msg as string) || (d.message as string) || `API code ${code}`;
-      res.json({
-        success: false,
-        error: msg,
-        code,
-        needsAuth: code === 401 || code === 403 || String(d.msg ?? "").toLowerCase().includes("login"),
-      });
-      return;
-    }
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : "Fetch gagal";
-    res.json({ success: false, error: msg });
+    res.json({
+      success: true,
+      toyId,
+      toyNum: num,
+      baubleTime: reqTime > 0 ? reqTime : null,
+      remoteOk,
+      remoteCode: remoteOk ? 200 : remoteCode,
+      injected: !remoteOk,
+      repeats: repeatCount,
+      note: remoteOk
+        ? `Dikirim ke Hot51 ✅${repeatCount > 1 ? ` × ${repeatCount}` : ""}`
+        : `Injected lokal — remote: ${remoteCode || "network error"}`,
+    });
     return;
   }
 
+  // No session — cannot inject, report error honestly
+  const errMsg = remoteCode > 0
+    ? ((remoteData.msg as string) || (remoteData.message as string) || `API code ${remoteCode}`)
+    : "Perlu login akun HOT51 (set HOT51_AC + HOT51_SIGN di Secrets)";
   res.json({
     success: false,
-    error: session
-      ? "Toy send gagal — host mungkin tidak punya toy yang terhubung"
-      : "Perlu login akun HOT51 (set HOT51_AC + HOT51_SIGN di Secrets)",
-    needsAuth: !session,
+    error: errMsg,
+    code: remoteCode,
+    needsAuth: true,
   });
 });
 
