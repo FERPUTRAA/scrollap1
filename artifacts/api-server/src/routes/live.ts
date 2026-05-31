@@ -266,15 +266,43 @@ interface Session {
   sign: string;
   username: string;
   phone?: string;
+  token?: string;    // Bearer JWT (for user-authenticated endpoints like toy/send)
+  memberId?: string; // extracted from JWT payload
+  area?: string;
 }
 
 let session: Session | null = null;
 
+/** Decode a JWT payload without verifying signature (Base64url decode only) */
+function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
+  try {
+    const parts = jwt.split(".");
+    if (parts.length !== 3) return null;
+    const padded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = Buffer.from(padded, "base64").toString("utf-8");
+    return JSON.parse(json) as Record<string, unknown>;
+  } catch { return null; }
+}
+
+/** Extract memberId string from a Bearer JWT payload */
+function memberIdFromJwt(jwt: string): string | null {
+  const payload = decodeJwtPayload(jwt);
+  if (!payload) return null;
+  // JWT payload field is "memberId" per traffic capture
+  const mid = payload.memberId ?? payload.userId ?? payload.uid;
+  return mid ? String(mid) : null;
+}
+
 if (process.env.HOT51_AC && process.env.HOT51_SIGN) {
+  const sign = process.env.HOT51_SIGN;
+  const isJwt = sign.startsWith("eyJ");
+  const memberId = isJwt ? (memberIdFromJwt(sign) ?? undefined) : undefined;
   session = {
     ac: process.env.HOT51_AC,
-    sign: process.env.HOT51_SIGN,
+    sign,
     username: process.env.HOT51_USERNAME ?? "",
+    token: isJwt ? sign : undefined,
+    memberId,
   };
 }
 
@@ -293,6 +321,24 @@ function getPostHeaders(body?: string): Record<string, string> {
     ac: session.ac,
     sign,
   };
+}
+
+/** Headers for user-authenticated endpoints (toy/send, toy/list) — uses Bearer JWT */
+function getBearerHeaders(body?: string): Record<string, string> {
+  const bearerToken = session?.token ?? (session?.sign?.startsWith("eyJ") ? session.sign : null);
+  const sign = session ? session.sign : signForBody(body ?? "");
+  const h: Record<string, string> = {
+    ...BASE_HEADERS,
+    username: session?.username ?? "",
+    ac: session?.ac ?? GUEST_AC,
+    sign,
+  };
+  if (bearerToken) h["Authorization"] = `Bearer ${bearerToken}`;
+  if (body) {
+    h["Content-Type"] = "application/json; charset=utf-8";
+    h["Content-Length"] = String(Buffer.byteLength(body, "utf-8"));
+  }
+  return h;
 }
 
 /** @deprecated Use getPostHeaders(body) for POST, getGuestGetHeaders() for GET */
@@ -1256,7 +1302,15 @@ liveRouter.post("/verify-otp", async (req: Request, res: Response) => {
         return;
       }
 
-      session = { ac, sign, username: username || normalizedPhone, phone: normalizedPhone };
+      const isJwt = sign.startsWith("eyJ");
+      session = {
+        ac,
+        sign,
+        username: username || normalizedPhone,
+        phone: normalizedPhone,
+        token: isJwt ? sign : undefined,
+        memberId: isJwt ? (memberIdFromJwt(sign) ?? undefined) : undefined,
+      };
       cache = null;
       req.log.info({ ac, username: session.username }, "session saved");
       res.json({ success: true, username: session.username, message: "Login berhasil!" });
@@ -1276,7 +1330,14 @@ liveRouter.post("/set-credentials", (req: Request, res: Response) => {
     res.status(400).json({ success: false, error: "ac and sign required" });
     return;
   }
-  session = { ac, sign, username };
+  const isJwt2 = sign.startsWith("eyJ");
+  session = {
+    ac,
+    sign,
+    username,
+    token: isJwt2 ? sign : undefined,
+    memberId: isJwt2 ? (memberIdFromJwt(sign) ?? undefined) : undefined,
+  };
   cache = null;
   res.json({ success: true, message: "Credentials set" });
 });
@@ -2335,64 +2396,100 @@ liveRouter.get("/live-sse", async (req: Request, res: Response) => {
   });
 });
 
-/** POST /api/toy-interact — kirim interaksi Lovense toy ke anchor */
+/** GET /api/toys — ambil daftar toy dari Hot51 (GET /plr/financemo/toy/v2/get/list) */
+liveRouter.get("/toys", async (_req: Request, res: Response) => {
+  const toyListUrl = withTimestamp(
+    `${HOT51_BASE}/${MERCHANT_ID}/api/plr/financemo/toy/v2/get/list?merchantId=${MERCHANT_ID}`
+  );
+  try {
+    const data = await hotFetch(toyListUrl, {
+      method: "GET",
+      headers: getBearerHeaders(),
+      timeoutMs: 10_000,
+    });
+    const d = data as Record<string, unknown>;
+    const code = Number(d?.code ?? d?.status ?? 0);
+    if (code === 200 || Array.isArray(d?.data) || (d?.data && typeof d.data === "object")) {
+      res.json({ success: true, data: d?.data ?? d, hasAuth: !!session?.token });
+      return;
+    }
+    res.json({
+      success: false,
+      error: (d?.msg as string) || (d?.message as string) || `API code ${code}`,
+      code,
+      needsAuth: code === 401 || code === 403,
+    });
+  } catch (err: unknown) {
+    res.json({ success: false, error: err instanceof Error ? err.message : "Fetch gagal" });
+  }
+});
+
+/** POST /api/toy-interact — kirim toy ke anchor menggunakan POST /plr/toy/send */
 liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
-  const { anchorId, liveId, level, duration } = (req.body ?? {}) as {
-    anchorId?: string; liveId?: string; level?: number; duration?: number;
+  const { anchorId, toyId, toyNum = 1 } = (req.body ?? {}) as {
+    anchorId?: string; toyId?: string; toyNum?: number;
   };
-  if (!anchorId || !liveId) {
-    res.status(400).json({ success: false, error: "anchorId dan liveId diperlukan" });
+  if (!anchorId || !toyId) {
+    res.status(400).json({ success: false, error: "anchorId dan toyId diperlukan" });
     return;
   }
 
-  const lvl = Math.max(1, Math.min(4, Number(level) || 1));
-  const bt  = Math.max(1, Math.min(10, Number(duration) || 3));
-  const levelName = ["", "Low", "Mid", "High", "Super"][lvl];
+  const num = Math.max(1, Number(toyNum) || 1);
+  const memberId = session?.memberId ?? null;
 
-  // Try multiple Hot51 toy/vibrator API paths (from APK smali decompile)
-  const bodyObj = { anchorId, liveId, level: lvl, baubleTime: bt, merchantId: Number(MERCHANT_ID) };
+  // Body sesuai traffic capture: {toyId, memberId, anchorId, area, toyNum}
+  // memberId harus number (besar) sesuai capture: 2061018930369236993
+  const bodyObj: Record<string, unknown> = {
+    toyId: String(toyId),
+    anchorId,
+    area: session?.area ?? "ID",
+    toyNum: num,
+  };
+  // Tambahkan memberId jika tersedia (dari JWT payload)
+  if (memberId) bodyObj.memberId = Number(memberId);
+
   const bodyStr = JSON.stringify(bodyObj);
+  const toyUrl = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/send`);
 
-  const toyEndpoints = [
-    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/interact`),
-    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/zbliv/toy/interact`),
-    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/live/toy/interact`),
-  ];
-
-  for (const toyUrl of toyEndpoints) {
-    try {
-      const data = await hotFetch(toyUrl, {
-        method: "POST",
-        headers: getPostHeaders(bodyStr),
-        body: bodyStr,
-        timeoutMs: 8_000,
+  try {
+    const data = await hotFetch(toyUrl, {
+      method: "POST",
+      headers: getBearerHeaders(bodyStr),
+      body: bodyStr,
+      timeoutMs: 10_000,
+    });
+    const d = data as Record<string, unknown>;
+    const code = Number(d?.code ?? d?.status ?? 0);
+    if (code === 200 || d?.success === true) {
+      broadcastRoom(anchorId, "lovense", {
+        nickname: session?.username ?? "Penonton",
+        toyId,
+        toyNum: num,
+        real: true,
       });
-      const d = data as Record<string, unknown>;
-      const code = Number(d?.code ?? d?.status ?? 0);
-      if (code === 200 || d?.success === true) {
-        // Real API success — broadcast to SSE clients
-        broadcastRoom(anchorId, "lovense", { nickname: session?.username ?? "Penonton", level: levelName, duration: bt, real: true });
-        res.json({ success: true, data: d, level: levelName, duration: bt });
-        return;
-      }
-      if (code > 0 && code !== 200) {
-        const msg = (d.msg as string) || (d.message as string) || `API code ${code}`;
-        res.json({
-          success: false,
-          error: msg,
-          code,
-          needsAuth: code === 401 || code === 403 || String(d.msg).toLowerCase().includes("login"),
-        });
-        return;
-      }
-    } catch { continue; }
+      res.json({ success: true, data: d, toyId, toyNum: num });
+      return;
+    }
+    if (code > 0) {
+      const msg = (d.msg as string) || (d.message as string) || `API code ${code}`;
+      res.json({
+        success: false,
+        error: msg,
+        code,
+        needsAuth: code === 401 || code === 403 || String(d.msg ?? "").toLowerCase().includes("login"),
+      });
+      return;
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : "Fetch gagal";
+    res.json({ success: false, error: msg });
+    return;
   }
 
-  // All endpoints failed — report honestly, do NOT fake local broadcast
   res.json({
     success: false,
     error: session
-      ? "Toy interact gagal — host mungkin tidak punya Lovense yang terhubung"
+      ? "Toy send gagal — host mungkin tidak punya toy yang terhubung"
       : "Perlu login akun HOT51 (set HOT51_AC + HOT51_SIGN di Secrets)",
     needsAuth: !session,
   });

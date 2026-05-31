@@ -1,30 +1,26 @@
-import React, { useState, useCallback } from "react";
+import React, { useState, useCallback, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Zap, Lock, CheckCircle, AlertCircle } from "lucide-react";
+import { X, Zap, Lock, CheckCircle, AlertCircle, RefreshCw } from "lucide-react";
 
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, "");
 
-interface VibratorLevel {
-  id: 1 | 2 | 3 | 4;
-  label: string;
-  icon: string;
-  color: string;
-  shadow: string;
-  duration: number;
+interface Toy {
+  id: number;
+  toyName: string;
+  toyPrice: number;
+  baubleTime: number;
+  baubleGrade: number;
+  toyPriceStr?: string;
 }
 
-const LEVELS: VibratorLevel[] = [
-  { id: 1, label: "Low",   icon: "〰️", color: "#69C9D0", shadow: "#69C9D044", duration: 2 },
-  { id: 2, label: "Mid",   icon: "〽️", color: "#FFD700", shadow: "#FFD70044", duration: 3 },
-  { id: 3, label: "High",  icon: "⚡", color: "#FF8C00", shadow: "#FF8C0044", duration: 5 },
-  { id: 4, label: "Super", icon: "💥", color: "#EE1D52", shadow: "#EE1D5244", duration: 7 },
-];
+const GRADE_COLOR = ["#69C9D0", "#22c55e", "#FF8C00", "#EE1D52"];
+const GRADE_LABEL = ["Basic", "Low", "Mid", "High"];
+const GRADE_ICON  = ["〰️", "〽️", "⚡", "💥"];
 
 interface ResultState {
   ok: boolean;
   msg: string;
   needsAuth?: boolean;
-  real?: boolean;
 }
 
 interface Props {
@@ -36,64 +32,94 @@ interface Props {
   onChatMsg?: (text: string) => void;
 }
 
-export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, streamerName, onChatMsg }: Props) {
-  const [selected, setSelected] = useState<VibratorLevel>(LEVELS[0]);
-  const [duration, setDuration] = useState(3);
+export default function Hot51VibratorPanel({
+  open, onClose, anchorId, streamerName, onChatMsg,
+}: Props) {
+  const [toys, setToys] = useState<Toy[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Toy | null>(null);
   const [sending, setSending] = useState(false);
   const [result, setResult] = useState<ResultState | null>(null);
 
-  const hapticFeedback = useCallback((level: number, dur: number) => {
+  const fetchToys = useCallback(async () => {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const res = await fetch(`${BASE}/api/toys`);
+      const data = await res.json() as {
+        success: boolean;
+        data?: unknown;
+        error?: string;
+      };
+      if (data.success) {
+        const raw = data.data;
+        const list: Toy[] = Array.isArray(raw)
+          ? (raw as Toy[])
+          : Array.isArray((raw as Record<string, unknown>)?.list)
+            ? ((raw as Record<string, unknown>).list as Toy[])
+            : [];
+        // Sort by price ascending
+        list.sort((a, b) => (a.toyPrice ?? 0) - (b.toyPrice ?? 0));
+        setToys(list);
+        if (list.length > 0) setSelected(list[0]);
+      } else {
+        setLoadError(data.error ?? "Gagal memuat daftar toy");
+      }
+    } catch {
+      setLoadError("Koneksi ke server gagal");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (open && toys.length === 0 && !loading) fetchToys();
+  }, [open]);
+
+  const haptic = useCallback(() => {
     if (!("vibrate" in navigator)) return;
-    const patterns: Record<number, number[]> = {
-      1: [200, 100, 200],
-      2: [300, 80, 300, 80, 300],
-      3: [400, 60, 400, 60, 400, 60, 400],
-      4: [500, 40, 500, 40, 500, 40, 500, 40, 500],
-    };
-    const base = patterns[level] || [200];
-    const repeats = Math.ceil(dur / 1.5);
-    const full: number[] = [];
-    for (let i = 0; i < repeats; i++) full.push(...base, 120);
-    navigator.vibrate(full);
+    navigator.vibrate([400, 60, 400, 60, 400]);
   }, []);
 
   const handleSend = useCallback(async () => {
-    if (sending) return;
+    if (sending || !selected) return;
     setSending(true);
     setResult(null);
-
     try {
       const res = await fetch(`${BASE}/api/toy-interact`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ anchorId, liveId, level: selected.id, duration }),
+        body: JSON.stringify({
+          anchorId,
+          toyId: String(selected.id),
+          toyNum: 1,
+        }),
       });
       const data = await res.json() as {
         success: boolean;
         error?: string;
-        note?: string;
         needsAuth?: boolean;
-        level?: string;
-        duration?: number;
       };
 
       if (data.success) {
-        // Real API success — also trigger device haptic
-        hapticFeedback(selected.id, duration);
-        setResult({ ok: true, msg: `✅ Lovense ${data.level ?? selected.label} aktif ${data.duration ?? duration}s`, real: true });
-        onChatMsg?.(`💥 Lovense ${selected.label} bergetar ${duration}s untuk ${streamerName}`);
+        haptic();
+        setResult({ ok: true, msg: `✅ ${selected.toyName} berhasil dikirim ke ${streamerName}` });
+        onChatMsg?.(`💥 Mengirim "${selected.toyName}" untuk ${streamerName}`);
       } else if (data.needsAuth) {
         setResult({ ok: false, msg: "🔒 Perlu login HOT51 (set HOT51_AC + HOT51_SIGN di Secrets)", needsAuth: true });
       } else {
-        setResult({ ok: false, msg: data.error ?? data.note ?? "Gagal — host mungkin tidak punya Lovense" });
+        setResult({ ok: false, msg: data.error ?? "Gagal — host mungkin tidak punya toy terhubung" });
       }
     } catch {
       setResult({ ok: false, msg: "Koneksi ke server gagal" });
     } finally {
       setSending(false);
-      setTimeout(() => setResult(null), 4000);
+      setTimeout(() => setResult(null), 5000);
     }
-  }, [sending, selected, duration, anchorId, liveId, streamerName, onChatMsg, hapticFeedback]);
+  }, [sending, selected, anchorId, streamerName, onChatMsg, haptic]);
+
+  const gradeOf = (t: Toy) => Math.min(3, Math.max(0, t.baubleGrade ?? 0));
 
   return (
     <AnimatePresence>
@@ -108,7 +134,11 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
           />
           <motion.div
             className="absolute bottom-[50px] left-0 right-0 z-50 rounded-t-2xl overflow-hidden"
-            style={{ background: "rgba(10,10,18,0.98)", backdropFilter: "blur(24px)", border: "1px solid rgba(255,255,255,0.08)" }}
+            style={{
+              background: "rgba(10,10,18,0.98)",
+              backdropFilter: "blur(24px)",
+              border: "1px solid rgba(255,255,255,0.08)",
+            }}
             initial={{ y: "100%" }}
             animate={{ y: 0 }}
             exit={{ y: "100%" }}
@@ -117,77 +147,151 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
             {/* Header */}
             <div className="flex items-center justify-between px-4 pt-4 pb-3">
               <div className="flex items-center gap-2">
-                <div className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: "linear-gradient(135deg,#EE1D52,#FF6B9D)" }}>
+                <div
+                  className="w-7 h-7 rounded-full flex items-center justify-center"
+                  style={{ background: "linear-gradient(135deg,#EE1D52,#FF6B9D)" }}
+                >
                   <Zap size={14} color="white" />
                 </div>
-                <span className="text-white font-bold text-sm">Lovense</span>
+                <span className="text-white font-bold text-sm">Toy</span>
                 <span className="text-white/40 text-xs">• {streamerName}</span>
               </div>
-              <button onClick={onClose}><X size={18} color="rgba(255,255,255,0.4)" /></button>
+              <div className="flex items-center gap-2">
+                <button onClick={fetchToys} disabled={loading} className="p-1">
+                  <motion.div
+                    animate={loading ? { rotate: 360 } : { rotate: 0 }}
+                    transition={{ repeat: loading ? Infinity : 0, duration: 0.9, ease: "linear" }}
+                  >
+                    <RefreshCw size={14} color="rgba(255,255,255,0.35)" />
+                  </motion.div>
+                </button>
+                <button onClick={onClose}>
+                  <X size={18} color="rgba(255,255,255,0.4)" />
+                </button>
+              </div>
             </div>
 
             <div className="px-4 pb-5">
-              {/* Level selector */}
-              <p className="text-white/40 text-[10px] uppercase tracking-widest mb-2">Intensitas</p>
-              <div className="grid grid-cols-4 gap-2 mb-4">
-                {LEVELS.map((lv) => (
-                  <motion.button
-                    key={lv.id}
-                    whileTap={{ scale: 0.92 }}
-                    onClick={() => { setSelected(lv); setDuration(lv.duration); }}
-                    className="flex flex-col items-center gap-1.5 py-3 rounded-xl transition-all"
-                    style={{
-                      background: selected.id === lv.id ? lv.shadow : "rgba(255,255,255,0.04)",
-                      border: `2px solid ${selected.id === lv.id ? lv.color : "transparent"}`,
-                      boxShadow: selected.id === lv.id ? `0 0 16px ${lv.shadow}` : "none",
-                    }}
-                  >
-                    <span className="text-2xl">{lv.icon}</span>
-                    <span className="text-[11px] font-bold" style={{ color: selected.id === lv.id ? lv.color : "rgba(255,255,255,0.5)" }}>
-                      {lv.label}
-                    </span>
-                  </motion.button>
-                ))}
-              </div>
-
-              {/* Duration slider */}
-              <p className="text-white/40 text-[10px] uppercase tracking-widest mb-2">
-                Durasi: <span className="text-white font-bold">{duration}s</span>
-              </p>
-              <div className="relative mb-4">
-                <input
-                  type="range"
-                  min={1}
-                  max={10}
-                  value={duration}
-                  onChange={(e) => setDuration(Number(e.target.value))}
-                  className="w-full h-1.5 rounded-full appearance-none cursor-pointer"
-                  style={{
-                    background: `linear-gradient(to right, ${selected.color} ${(duration - 1) * 11.1}%, rgba(255,255,255,0.15) ${(duration - 1) * 11.1}%)`,
-                  }}
-                />
-                <div className="flex justify-between mt-1">
-                  {[1, 3, 5, 7, 10].map(v => (
-                    <span key={v} className="text-[9px] text-white/25">{v}s</span>
-                  ))}
+              {/* Loading */}
+              {loading && (
+                <div className="flex items-center justify-center py-8 gap-3">
+                  <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 0.9, ease: "linear" }}>
+                    <RefreshCw size={18} color="#EE1D52" />
+                  </motion.div>
+                  <span className="text-white/50 text-sm">Memuat daftar toy...</span>
                 </div>
-              </div>
+              )}
+
+              {/* Load error */}
+              {!loading && loadError && (
+                <div className="py-4">
+                  <div
+                    className="px-3 py-3 rounded-xl flex flex-col gap-2"
+                    style={{ background: "rgba(238,29,82,0.10)", border: "1px solid rgba(238,29,82,0.25)" }}
+                  >
+                    <div className="flex items-center gap-2">
+                      <AlertCircle size={13} color="#EE1D52" />
+                      <span className="text-xs text-red-300">{loadError}</span>
+                    </div>
+                    <button onClick={fetchToys} className="text-[11px] text-white/50 underline text-left">
+                      Coba lagi
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Toy grid */}
+              {!loading && toys.length > 0 && (
+                <>
+                  <p className="text-white/40 text-[10px] uppercase tracking-widest mb-2">
+                    Pilih Toy ({toys.length})
+                  </p>
+                  <div className="grid grid-cols-3 gap-2 mb-4 max-h-52 overflow-y-auto pr-0.5">
+                    {toys.map((toy) => {
+                      const grade = gradeOf(toy);
+                      const color = GRADE_COLOR[grade];
+                      const icon  = GRADE_ICON[grade];
+                      const isSelected = selected?.id === toy.id;
+                      return (
+                        <motion.button
+                          key={toy.id}
+                          whileTap={{ scale: 0.92 }}
+                          onClick={() => setSelected(toy)}
+                          className="flex flex-col items-center gap-1 py-3 px-1 rounded-xl transition-all"
+                          style={{
+                            background: isSelected
+                              ? `${color}22`
+                              : "rgba(255,255,255,0.04)",
+                            border: `2px solid ${isSelected ? color : "transparent"}`,
+                            boxShadow: isSelected ? `0 0 14px ${color}44` : "none",
+                          }}
+                        >
+                          <span className="text-2xl leading-none">{icon}</span>
+                          <span
+                            className="text-[10px] font-semibold text-center leading-tight line-clamp-2 px-0.5"
+                            style={{ color: isSelected ? color : "rgba(255,255,255,0.6)" }}
+                          >
+                            {toy.toyName}
+                          </span>
+                          <span className="text-[9px]" style={{ color: "rgba(255,215,0,0.75)" }}>
+                            🪙 {(toy.toyPrice / 1000).toFixed(0)}K
+                          </span>
+                          <span className="text-[8px]" style={{ color: "rgba(255,255,255,0.3)" }}>
+                            {toy.baubleTime}s
+                          </span>
+                        </motion.button>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+
+              {/* Selected toy summary bar */}
+              {selected && !loading && (
+                <div
+                  className="flex items-center gap-2 mb-3 px-2 py-1.5 rounded-lg"
+                  style={{ background: "rgba(255,255,255,0.04)" }}
+                >
+                  <span className="text-white/40 text-[11px]">Dipilih:</span>
+                  <span className="text-white text-[11px] font-semibold">{selected.toyName}</span>
+                  <span className="text-[10px] ml-1" style={{ color: GRADE_COLOR[gradeOf(selected)] }}>
+                    {GRADE_LABEL[gradeOf(selected)]}
+                  </span>
+                  <span className="ml-auto text-[10px]" style={{ color: "rgba(255,215,0,0.8)" }}>
+                    🪙 {(selected.toyPrice / 1000).toFixed(0)}K
+                  </span>
+                  <span className="text-[10px]" style={{ color: "rgba(255,255,255,0.3)" }}>
+                    {selected.baubleTime}s
+                  </span>
+                </div>
+              )}
 
               {/* Send button */}
               <motion.button
                 whileTap={{ scale: 0.97 }}
                 onClick={handleSend}
-                disabled={sending}
+                disabled={sending || !selected}
                 className="w-full py-3 rounded-xl font-bold text-sm text-white flex items-center justify-center gap-2"
                 style={{
-                  background: sending ? "rgba(255,255,255,0.1)" : `linear-gradient(135deg, ${selected.color}, ${selected.color}aa)`,
-                  opacity: sending ? 0.7 : 1,
+                  background:
+                    sending || !selected
+                      ? "rgba(255,255,255,0.1)"
+                      : `linear-gradient(135deg, ${selected ? GRADE_COLOR[gradeOf(selected)] : "#EE1D52"}, #EE1D52)`,
+                  opacity: sending || !selected ? 0.6 : 1,
                 }}
               >
                 {sending ? (
-                  <><motion.span animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 0.8, ease: "linear" }}>〰️</motion.span> Mengirim...</>
+                  <>
+                    <motion.div animate={{ rotate: 360 }} transition={{ repeat: Infinity, duration: 0.8, ease: "linear" }}>
+                      <Zap size={14} />
+                    </motion.div>
+                    Mengirim...
+                  </>
                 ) : (
-                  <><span>{selected.icon}</span> Aktifkan {selected.label} {duration}s</>
+                  <>
+                    <Zap size={14} />
+                    {selected ? `Kirim ${selected.toyName}` : "Pilih toy dulu"}
+                  </>
                 )}
               </motion.button>
 
@@ -205,7 +309,11 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
                         : result.needsAuth
                           ? "rgba(255,215,0,0.10)"
                           : "rgba(238,29,82,0.12)",
-                      border: `1px solid ${result.ok ? "rgba(34,197,94,0.3)" : result.needsAuth ? "rgba(255,215,0,0.3)" : "rgba(238,29,82,0.3)"}`,
+                      border: `1px solid ${result.ok
+                        ? "rgba(34,197,94,0.3)"
+                        : result.needsAuth
+                          ? "rgba(255,215,0,0.3)"
+                          : "rgba(238,29,82,0.3)"}`,
                     }}
                   >
                     {result.ok ? (
@@ -226,7 +334,7 @@ export default function Hot51VibratorPanel({ open, onClose, anchorId, liveId, st
               </AnimatePresence>
 
               <p className="text-white/20 text-[9px] text-center mt-3">
-                Mengirim sinyal ke Lovense host • Memerlukan akun HOT51 login
+                Kirim toy ke host via HOT51 API • Memerlukan akun login
               </p>
             </div>
           </motion.div>
