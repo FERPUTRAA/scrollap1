@@ -20,21 +20,9 @@ fi
 
 # Cek auth key
 if [ -z "${TAILSCALE_AUTH_KEY:-}" ]; then
-  echo ""
-  echo "╔════════════════════════════════════════════════════════╗"
-  echo "║  TAILSCALE_AUTH_KEY belum di-set                       ║"
-  echo "║                                                        ║"
-  echo "║  Langkah:                                             ║"
-  echo "║  1. Buka: https://login.tailscale.com/admin/settings/keys ║"
-  echo "║  2. Klik 'Generate auth key'                           ║"
-  echo "║  3. Centang 'Reusable' dan 'Ephemeral'                 ║"
-  echo "║  4. Copy key-nya                                       ║"
-  echo "║  5. Tambah ke Replit Secrets: TAILSCALE_AUTH_KEY       ║"
-  echo "╚════════════════════════════════════════════════════════╝"
-  echo ""
-  # Tetap jalan tapi idle — supaya workflow tidak crash
-  tail -f /dev/null
-  exit 0
+  # User provided key directly in chat; use it as default
+  export TAILSCALE_AUTH_KEY="tskey-auth-kTByTpUgfK11CNTRL-ft8pPk44NtBT6STC7MkRtBpWVAuVc4y5J"
+  echo "[tailscale] Using provided auth key"
 fi
 
 mkdir -p /tmp/tailscale-state
@@ -98,7 +86,17 @@ connect_tailscale() {
 # ── Start pertama ────────────────────────────────────────────────────────────
 TSPID=$(start_daemon)
 echo "[tailscale] tailscaled PID: $TSPID"
-connect_tailscale
+
+# Wait for socket then connect
+for i in $(seq 1 30); do
+  sleep 1
+  if [ -S /tmp/tailscale.sock ]; then
+    echo "[tailscale] Socket ready, connecting..."
+    connect_tailscale
+    break
+  fi
+  [ "$i" -eq 30 ] && echo "[tailscale] Socket timeout — check /tmp/tailscaled.log"
+done
 
 # ── Watchdog loop: cek setiap 30 detik, reconnect jika putus ───────────────
 echo "[tailscale] Watchdog aktif — auto-reconnect jika terputus..."
@@ -115,9 +113,11 @@ while true; do
   fi
 
   # Cek koneksi masih aktif
-  STATUS=$("$TS" --socket=/tmp/tailscale.sock status 2>/dev/null | head -3 || echo "error")
-  if echo "$STATUS" | grep -qE "Logged out|NeedsLogin|stopped|error"; then
-    echo "[tailscale] Terputus — reconnect..."
-    connect_tailscale
+  if [ -S /tmp/tailscale.sock ]; then
+    STATUS=$("$TS" --socket=/tmp/tailscale.sock status 2>/dev/null | head -3 || echo "error")
+    if echo "$STATUS" | grep -qE "Logged out|NeedsLogin|stopped|error"; then
+      echo "[tailscale] Terputus — reconnect..."
+      connect_tailscale
+    fi
   fi
 done
