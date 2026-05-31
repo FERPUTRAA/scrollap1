@@ -327,8 +327,10 @@ function getPostHeaders(body?: string): Record<string, string> {
 
 /** Headers for user-authenticated endpoints (toy/send, toy/list) — uses Bearer JWT */
 function getBearerHeaders(body?: string): Record<string, string> {
+  // bearerToken: the JWT used for Authorization header
   const bearerToken = session?.token ?? (session?.sign?.startsWith("eyJ") ? session.sign : null);
-  const sign = session ? session.sign : signForBody(body ?? "");
+  // sign: always derive from body HMAC, never use the JWT as the sign header
+  const sign = signForBody(body ?? "");
   const h: Record<string, string> = {
     ...BASE_HEADERS,
     username: session?.username ?? "",
@@ -2471,17 +2473,21 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
   const reqTime  = Math.max(0, Math.min(420, Number(baubleTime) || 0)); // cap 7 menit
   const memberId = session?.memberId ?? null;
 
-  /** Build one POST body — field order matches APK traffic exactly: toyId,memberId,anchorId,area,toyNum */
+  /** Build one POST body — field order matches APK traffic exactly: toyId,memberId,anchorId,area,toyNum
+   *  memberId is a 64-bit integer larger than Number.MAX_SAFE_INTEGER so we inject it as a raw
+   *  numeric literal into the JSON string to avoid JavaScript precision loss. */
   const makeBody = (bt?: number): string => {
-    const obj: Record<string, unknown> = {
-      toyId: String(toyId),
-    };
-    if (memberId) obj.memberId = Number(memberId); // memberId as number, second field
-    obj.anchorId = anchorId;
-    obj.area = session?.area ?? "ID";
-    obj.toyNum = num;
-    if (bt && bt > 0) obj.baubleTime = bt; // attempt server-side override
-    return JSON.stringify(obj);
+    const parts: string[] = [];
+    parts.push(`"toyId":${JSON.stringify(String(toyId))}`);
+    if (memberId) {
+      // Inject raw digits — no Number() conversion to preserve full 64-bit precision
+      parts.push(`"memberId":${String(memberId).replace(/[^0-9]/g, "")}`);
+    }
+    parts.push(`"anchorId":${JSON.stringify(String(anchorId))}`);
+    parts.push(`"area":${JSON.stringify(session?.area ?? "ID")}`);
+    parts.push(`"toyNum":${num}`);
+    if (bt && bt > 0) parts.push(`"baubleTime":${bt}`);
+    return `{${parts.join(",")}}`;
   };
 
   /** Send one request to Hot51 /plr/toy/send, return {ok, code, data} */
