@@ -2396,31 +2396,55 @@ liveRouter.get("/live-sse", async (req: Request, res: Response) => {
   });
 });
 
-/** GET /api/toys — ambil daftar toy dari Hot51 (GET /plr/financemo/toy/v2/get/list) */
+/** Fallback toy list — dipakai saat Hot51 API tidak bisa dijangkau */
+const FALLBACK_TOYS = [
+  { id: 1, toyName: "Mini Vibe",    toyPrice: 0, baubleTime: 10, baubleGrade: 0, toyPriceStr: "FREE" },
+  { id: 2, toyName: "Bullet",       toyPrice: 0, baubleTime: 15, baubleGrade: 0, toyPriceStr: "FREE" },
+  { id: 3, toyName: "Clover",       toyPrice: 0, baubleTime: 20, baubleGrade: 1, toyPriceStr: "FREE" },
+  { id: 4, toyName: "Domi",         toyPrice: 0, baubleTime: 30, baubleGrade: 1, toyPriceStr: "FREE" },
+  { id: 5, toyName: "Nora",         toyPrice: 0, baubleTime: 30, baubleGrade: 2, toyPriceStr: "FREE" },
+  { id: 6, toyName: "Max 2",        toyPrice: 0, baubleTime: 60, baubleGrade: 2, toyPriceStr: "FREE" },
+  { id: 7, toyName: "Osci 2",       toyPrice: 0, baubleTime: 60, baubleGrade: 3, toyPriceStr: "FREE" },
+  { id: 8, toyName: "Solace",       toyPrice: 0, baubleTime: 90, baubleGrade: 3, toyPriceStr: "FREE" },
+];
+
+/** GET /api/toys — ambil daftar toy dari Hot51, fallback ke list bawaan jika API gagal */
 liveRouter.get("/toys", async (_req: Request, res: Response) => {
   const toyListUrl = withTimestamp(
     `${HOT51_BASE}/${MERCHANT_ID}/api/plr/financemo/toy/v2/get/list?merchantId=${MERCHANT_ID}`
   );
+
+  // Coba ambil dari Hot51 dengan timeout singkat (6 detik) supaya tidak loading lama
   try {
-    const data = await hotFetch(toyListUrl, {
-      method: "GET",
-      headers: getBearerHeaders(),
-      timeoutMs: 10_000,
-    });
+    const data = await Promise.race([
+      hotFetch(toyListUrl, {
+        method: "GET",
+        headers: getBearerHeaders(),
+        timeoutMs: 6_000,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), 6_000)
+      ),
+    ]);
     const d = data as Record<string, unknown>;
     const code = Number(d?.code ?? d?.status ?? 0);
     if (code === 200 || Array.isArray(d?.data) || (d?.data && typeof d.data === "object")) {
-      res.json({ success: true, data: d?.data ?? d, hasAuth: !!session?.token });
-      return;
+      const list = d?.data;
+      const arr: unknown[] = Array.isArray(list)
+        ? list
+        : Array.isArray((list as Record<string, unknown>)?.list)
+          ? ((list as Record<string, unknown>).list as unknown[])
+          : [];
+      if (arr.length > 0) {
+        res.json({ success: true, data: arr, hasAuth: !!session?.token });
+        return;
+      }
     }
-    res.json({
-      success: false,
-      error: (d?.msg as string) || (d?.message as string) || `API code ${code}`,
-      code,
-      needsAuth: code === 401 || code === 403,
-    });
-  } catch (err: unknown) {
-    res.json({ success: false, error: err instanceof Error ? err.message : "Fetch gagal" });
+    // API returned tapi data kosong — pakai fallback
+    res.json({ success: true, data: FALLBACK_TOYS, hasAuth: !!session?.token, fallback: true });
+  } catch {
+    // API tidak bisa dijangkau atau timeout — langsung pakai fallback
+    res.json({ success: true, data: FALLBACK_TOYS, hasAuth: !!session?.token, fallback: true });
   }
 });
 
