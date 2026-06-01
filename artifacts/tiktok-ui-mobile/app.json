@@ -1,11 +1,11 @@
 {
   "expo": {
-    "name": "Scrollap Mobile",
-    "slug": "tiktok-ui-mobile",
+    "name": "Scrolay",
+    "slug": "scrolay",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "scrollap",
+    "scheme": "scrolay",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "splash": {
@@ -15,13 +15,13 @@
     },
     "ios": {
       "supportsTablet": false,
-      "bundleIdentifier": "com.replit.scrollapmobile"
+      "bundleIdentifier": "com.scrolay.app"
     },
     "android": {
-      "package": "com.replit.scrollapmobile"
+      "package": "com.scrolay.app"
     },
     "web": {
-      "favicon": "./assets/images/icon.png"
+      "favicon": "./assets/images/favicon.png"
     },
     "plugins": [
       [
