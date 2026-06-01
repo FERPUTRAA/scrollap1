@@ -487,6 +487,20 @@ async function attemptFetch(
   }
 }
 
+/** Returns true if the API response indicates a geo-IP block (server reachable but IP banned) */
+function isIpLimitResponse(data: unknown): boolean {
+  if (!data || typeof data !== "object") return false;
+  const d = data as Record<string, unknown>;
+  const inner = d?.data as Record<string, unknown> | undefined;
+  return (
+    inner?.errorCode === "G10001" ||
+    inner?.localizedKey === "IP_LIMIT" ||
+    String(inner?.localizedValue ?? "").includes("IP is limit") ||
+    String(d?.msg ?? "").includes("IP") ||
+    String(d?.message ?? "").includes("IP")
+  );
+}
+
 async function hotFetch(
   url: string,
   options: { method: string; headers: Record<string, string>; body?: string; timeoutMs?: number }
@@ -496,10 +510,13 @@ async function hotFetch(
   const perAttemptMs = Math.min(5_000, Math.floor(totalTimeout * 0.4));
 
   // STEP 1: Try direct connection first (fastest, works if server isn't geo-blocked)
+  let directResult: unknown = null;
   try {
-    return await attemptFetch(url, options, undefined, perAttemptMs);
+    directResult = await attemptFetch(url, options, undefined, perAttemptMs);
+    // If direct succeeded but server returned IP_LIMIT, fall through to proxy
+    if (!isIpLimitResponse(directResult)) return directResult;
   } catch {
-    // direct failed — try proxies
+    // direct failed (network error) — try proxies
   }
 
   // STEP 2: Race up to 5 proxies at once in parallel batches for speed
@@ -508,12 +525,13 @@ async function hotFetch(
 
   for (let i = 0; i < liveProxies.length && i < 20; i += BATCH) {
     const batch = liveProxies.slice(i, i + BATCH);
-    // Race the batch — first success wins, others are abandoned
+    // Race the batch — first non-IP_LIMIT success wins, others are abandoned
     const result = await Promise.any(
       batch.map(async (proxyUrl) => {
         const dispatcher = getProxyAgent(proxyUrl);
         try {
           const data = await attemptFetch(url, options, dispatcher, perAttemptMs);
+          if (isIpLimitResponse(data)) throw new Error("IP_LIMIT via proxy");
           return data;
         } catch (e) {
           markDead(proxyUrl);
@@ -525,7 +543,8 @@ async function hotFetch(
     if (result !== null) return result;
   }
 
-  // STEP 3: Last resort — longer direct attempt
+  // STEP 3: Last resort — longer direct attempt (return whatever we get, even IP_LIMIT)
+  if (directResult !== null) return directResult;
   try {
     return await attemptFetch(url, options, undefined, totalTimeout);
   } catch (e) {
@@ -2531,8 +2550,10 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
 
   /** Build one POST body — field order matches APK traffic exactly: toyId,memberId,anchorId,area,toyNum
    *  memberId is a 64-bit integer larger than Number.MAX_SAFE_INTEGER so we inject it as a raw
-   *  numeric literal into the JSON string to avoid JavaScript precision loss. */
-  const makeBody = (bt?: number): string => {
+   *  numeric literal into the JSON string to avoid JavaScript precision loss.
+   *  NOTE: baubleTime is intentionally NOT included — real APK never sends it in the body.
+   *  Duration control is handled via repeat calls at the caller level. */
+  const makeBody = (): string => {
     const parts: string[] = [];
     parts.push(`"toyId":${JSON.stringify(String(toyId))}`);
     if (memberId) {
@@ -2542,7 +2563,6 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
     parts.push(`"anchorId":${JSON.stringify(String(anchorId))}`);
     parts.push(`"area":${JSON.stringify(session?.area ?? "ID")}`);
     parts.push(`"toyNum":${num}`);
-    if (bt && bt > 0) parts.push(`"baubleTime":${bt}`);
     return `{${parts.join(",")}}`;
   };
 
@@ -2567,8 +2587,7 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
   let repeatCount = 1;
 
   try {
-    // Try with baubleTime override first
-    const body1 = makeBody(reqTime > 0 ? reqTime : undefined);
+    const body1 = makeBody();
     const r1 = await sendOnce(body1);
     remoteOk   = r1.ok;
     remoteCode = r1.code;
@@ -2589,7 +2608,7 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
           for (let i = 1; i < repeatCount; i++) {
             await new Promise(r => setTimeout(r, nativeBt * 1000));
             try {
-              await sendOnce(makeBody(nativeBt));
+              await sendOnce(makeBody());
               broadcastRoom(anchorId, "lovense", {
                 nickname: session?.username ?? "Penonton",
                 toyId, toyNum: num, baubleTime: nativeBt,
@@ -2626,6 +2645,7 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
       baubleTime: reqTime > 0 ? reqTime : null,
       remoteOk,
       remoteCode: remoteOk ? 200 : remoteCode,
+      remoteMsg: remoteOk ? undefined : (remoteData?.msg ?? remoteData?.message ?? remoteData),
       injected: !remoteOk,
       repeats: repeatCount,
       note: remoteOk
