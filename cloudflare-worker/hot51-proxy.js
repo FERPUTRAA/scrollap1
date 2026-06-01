@@ -13,6 +13,10 @@
  * Mode 2 — ComHub API proxy (bypass IP block):
  *   POST https://worker.dev/comhub?path=/vchat/app/live/livingList
  *   GET  https://worker.dev/comhub?path=/vchat/app/live/list?page=1&pageSize=20
+ *
+ * Mode 3 — Hot51 API proxy (forward all headers + method + body, bypass IP_LIMIT):
+ *   POST https://worker.dev/api?url=https://api.fsccdn.com/501/api/plr/toy/send
+ *   GET  https://worker.dev/api?url=https://api.fsccdn.com/501/api/plr/...
  */
 
 const ALLOWED_CDN_DOMAINS = [
@@ -26,17 +30,28 @@ const ALLOWED_CDN_DOMAINS = [
   "bcdn4.livcdn.com",
 ];
 
+const ALLOWED_API_DOMAINS = [
+  "api.fsccdn.com",
+  "fsccdn.com",
+];
+
 const COMHUB_BASE = "https://www.comhub.live";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, HEAD, OPTIONS",
-  "Access-Control-Allow-Headers": "Range, Accept, Content-Type, token, userId, timestamp, CheckSum, serverVersion, appVersion, channel, bundleId, deviceType, deviceId, gender, channelStatus, countryCode, language, PhoneModel",
+  "Access-Control-Allow-Headers": "Range, Accept, Content-Type, token, userId, timestamp, CheckSum, serverVersion, appVersion, channel, bundleId, deviceType, deviceId, gender, channelStatus, countryCode, language, PhoneModel, Authorization, merchantId, ac, username, device, area, locale-language, client-type, dev-type, system-version, versionCode, time-zone, sign",
   "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Type",
 };
 
 function isCdnAllowed(hostname) {
   return ALLOWED_CDN_DOMAINS.some(
+    (d) => hostname === d || hostname.endsWith("." + d)
+  );
+}
+
+function isApiAllowed(hostname) {
+  return ALLOWED_API_DOMAINS.some(
     (d) => hostname === d || hostname.endsWith("." + d)
   );
 }
@@ -56,15 +71,73 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
+    // ── Mode 3: Hot51 API proxy (full header + method + body forwarding) ──
+    // Matches /api?url=https://api.fsccdn.com/...
+    if (url.pathname === "/api" || url.pathname.startsWith("/api/")) {
+      const targetUrl = url.searchParams.get("url");
+      if (!targetUrl) {
+        return jsonResponse({ error: "Missing ?url parameter for /api proxy" }, 400);
+      }
+
+      let parsedTarget;
+      try {
+        parsedTarget = new URL(targetUrl);
+      } catch {
+        return jsonResponse({ error: "Invalid URL parameter" }, 400);
+      }
+
+      if (!isApiAllowed(parsedTarget.hostname)) {
+        return jsonResponse({ error: "API domain not allowed: " + parsedTarget.hostname }, 403);
+      }
+
+      // Forward all Hot51 request headers except host/cf-specific ones
+      const fwdHeaders = new Headers();
+      const SKIP_HEADERS = new Set([
+        "host", "cf-connecting-ip", "cf-ipcountry", "cf-ray", "cf-visitor",
+        "x-forwarded-for", "x-forwarded-proto", "x-real-ip",
+        "cf-ew-via", "cdn-loop",
+      ]);
+      for (const [k, v] of request.headers.entries()) {
+        if (!SKIP_HEADERS.has(k.toLowerCase())) {
+          fwdHeaders.set(k, v);
+        }
+      }
+      // Always set host to the target
+      fwdHeaders.set("host", parsedTarget.hostname);
+
+      let body = undefined;
+      if (request.method === "POST" || request.method === "PUT" || request.method === "PATCH") {
+        body = await request.arrayBuffer();
+      }
+
+      try {
+        const upstream = await fetch(targetUrl, {
+          method: request.method,
+          headers: fwdHeaders,
+          body: body ?? undefined,
+        });
+        const text = await upstream.text();
+        return new Response(text, {
+          status: upstream.status,
+          headers: {
+            "Content-Type": upstream.headers.get("content-type") ?? "application/json",
+            ...CORS_HEADERS,
+            "X-Proxy-By": "hot51-cf-worker-api",
+            "X-Target": parsedTarget.hostname,
+          },
+        });
+      } catch (e) {
+        return jsonResponse({ error: "Hot51 API upstream failed: " + e.message }, 502);
+      }
+    }
+
     // ── Mode 2: ComHub API proxy ──────────────────────────────────
-    // Matches /comhub or /comhub?path=...
     if (url.pathname === "/comhub" || url.pathname.startsWith("/comhub/")) {
       const apiPath = url.searchParams.get("path") ?? url.pathname.replace(/^\/comhub/, "");
       if (!apiPath) {
         return jsonResponse({ error: "Missing ?path parameter" }, 400);
       }
 
-      // Preserve any extra query params from the path value itself
       const targetUrl = `${COMHUB_BASE}${apiPath}`;
 
       const fwdHeaders = new Headers();
@@ -116,7 +189,7 @@ export default {
     if (!targetUrl) {
       return jsonResponse({
         error: "Missing ?url parameter",
-        usage: "?url=https://pull.cdnsi.com/live/... OR /comhub?path=/vchat/app/...",
+        usage: "?url=https://pull.cdnsi.com/live/... OR /comhub?path=/vchat/app/... OR /api?url=https://api.fsccdn.com/...",
       }, 400);
     }
 

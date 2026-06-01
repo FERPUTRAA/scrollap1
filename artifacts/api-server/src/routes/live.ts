@@ -487,23 +487,29 @@ async function attemptFetch(
   }
 }
 
-/** Returns true if the API response indicates a geo-IP block (server reachable but IP banned) */
+/** Returns true if the API response indicates a geo-IP block (server reachable but IP banned).
+ *  Only matches exact Hot51 error codes — do NOT use broad string matching. */
 function isIpLimitResponse(data: unknown): boolean {
   if (!data || typeof data !== "object") return false;
   const d = data as Record<string, unknown>;
   const inner = d?.data as Record<string, unknown> | undefined;
   return (
     inner?.errorCode === "G10001" ||
-    inner?.localizedKey === "IP_LIMIT" ||
-    String(inner?.localizedValue ?? "").includes("IP is limit") ||
-    String(d?.msg ?? "").includes("IP") ||
-    String(d?.message ?? "").includes("IP")
+    inner?.localizedKey === "IP_LIMIT"
   );
 }
 
 async function hotFetch(
   url: string,
-  options: { method: string; headers: Record<string, string>; body?: string; timeoutMs?: number }
+  options: {
+    method: string;
+    headers: Record<string, string>;
+    body?: string;
+    timeoutMs?: number;
+    /** When true, if direct connection returns IP_LIMIT, retry through proxy pool.
+     *  Default false — GET endpoints should NOT enable this (causes timeout on dead proxies). */
+    retryOnIpLimit?: boolean;
+  }
 ): Promise<unknown> {
   const totalTimeout = options.timeoutMs ?? 15_000;
   // Per-attempt timeout: fast enough to try many proxies within total timeout
@@ -513,8 +519,8 @@ async function hotFetch(
   let directResult: unknown = null;
   try {
     directResult = await attemptFetch(url, options, undefined, perAttemptMs);
-    // If direct succeeded but server returned IP_LIMIT, fall through to proxy
-    if (!isIpLimitResponse(directResult)) return directResult;
+    // If direct succeeded and no IP_LIMIT retry requested, return immediately
+    if (!options.retryOnIpLimit || !isIpLimitResponse(directResult)) return directResult;
   } catch {
     // direct failed (network error) — try proxies
   }
@@ -2566,14 +2572,34 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
     return `{${parts.join(",")}}`;
   };
 
-  /** Send one request to Hot51 /plr/toy/send, return {ok, code, data} */
+  /** Send one request to Hot51 /plr/toy/send, return {ok, code, data}
+   *  Priority: 1) CF Worker proxy  2) hotFetch with proxy pool fallback */
   const sendOnce = async (body: string) => {
-    const url = `${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/send`;
-    const data = await hotFetch(url, {
+    const toyUrl = `${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/send`;
+    const headers = getBearerHeaders(body);
+
+    // 1. Try via Cloudflare Worker /api proxy (forwards all headers + method + body)
+    if (CF_WORKER_URL) {
+      try {
+        const cfUrl = `${CF_WORKER_URL}/api?url=${encodeURIComponent(toyUrl)}`;
+        const cfData = await attemptFetch(cfUrl, { method: "POST", headers, body }, undefined, 10_000);
+        const cfCode = Number((cfData as Record<string, unknown>)?.code ?? (cfData as Record<string, unknown>)?.status ?? 0);
+        const cfOk = cfCode === 200 || (cfData as Record<string, unknown>)?.success === true;
+        if (!isIpLimitResponse(cfData)) {
+          return { ok: cfOk, code: cfCode, data: cfData as Record<string, unknown> };
+        }
+      } catch {
+        // CF Worker failed — fall through to hotFetch
+      }
+    }
+
+    // 2. hotFetch with IP_LIMIT proxy retry
+    const data = await hotFetch(toyUrl, {
       method: "POST",
-      headers: getBearerHeaders(body),
+      headers,
       body,
       timeoutMs: 12_000,
+      retryOnIpLimit: true,
     }) as Record<string, unknown>;
     const code = Number(data?.code ?? data?.status ?? 0);
     const ok   = code === 200 || data?.success === true;
