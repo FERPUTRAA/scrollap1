@@ -2548,7 +2548,7 @@ liveRouter.post("/toy-interact", async (req: Request, res: Response) => {
 
   /** Send one request to Hot51 /plr/toy/send, return {ok, code, data} */
   const sendOnce = async (body: string) => {
-    const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/send`);
+    const url = `${HOT51_BASE}/${MERCHANT_ID}/api/plr/toy/send`;
     const data = await hotFetch(url, {
       method: "POST",
       headers: getBearerHeaders(body),
