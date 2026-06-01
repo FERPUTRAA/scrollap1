@@ -224,31 +224,73 @@ const BASE_HEADERS: Record<string, string> = {
 // GET request headers — no Authorization, no Content-Type
 const APP_HEADERS: Record<string, string> = { ...BASE_HEADERS };
 
-// Sign values captured from real APK traffic (Realme RMX2030, device 08b55dbd...).
-// sign = MD5(body_content + JNI_SALT) — salt is embedded in native lib, not known.
-// For empty-body POST (Content-Length: 0): sign is constant for this device.
-// For non-empty body: sign changes with body. We use captured per-body-type values as
-// best-effort constants — they may still work if the server does a lenient check.
-const SIGN_EMPTY_BODY      = "11f569ed792da4e0cff8a393534a5bf2"; // empty / form-urlencoded
-const SIGN_LIVE_NEXT       = "c01ca7f79119440f05281127fda04637"; // scrolliv/live/next body type
-const SIGN_ROOM_INFO       = "1867b90749947a889f6523f9097a70c2"; // room-info body type
-const SIGN_TOY_SEND        = "08c4e7c3bda811740bf8d087b3fcbcf6"; // toy/send body (versionCode 593)
+// ─── Hot51 Sign Algorithm ────────────────────────────────────────────────────
+// Reversed from libnative-lib.so ARM64 (ADRP+encode decode):
+//   encoded string at offset 0x1061, decode: byte[i] ^ i ^ 7
+// SALT = "rsba648b744646lkid9896bb1o7h9776"  (DO NOT hardcode in plain comments for security)
+const _MD5_SALT = Buffer.from(
+  "7575676535363962383a393a3f3c65637e722c2c2a2473722e712a74222d2e2e",
+  "hex"
+).reduce((s, b, i) => s + String.fromCharCode(b ^ i ^ 7), "");
 
-/** Pick captured sign for the given JSON body (best-effort — may differ per dynamic ID) */
-function signForBody(body: string): string {
-  if (!body || body === "{}") return SIGN_EMPTY_BODY;
-  if (body.startsWith('{"aid"')) return SIGN_LIVE_NEXT;
-  if (body.startsWith('{"anchorId"')) return SIGN_ROOM_INFO;
-  if (body.startsWith('{"toyId"')) return SIGN_TOY_SEND;
-  return SIGN_EMPTY_BODY; // fallback
+/** md5 helper — returns lowercase hex */
+function md5hex(s: string): string {
+  return crypto.createHash("md5").update(s, "utf8").digest("hex");
 }
 
-// POST request headers — includes Authorization: Basic (app-player) + Content-Type + sign
+/**
+ * Compute Hot51 sign from a concatenated-values string.
+ * sign = md5(md5(valuesConcat) + SALT)
+ */
+function computeSign(valuesConcat: string): string {
+  return md5hex(md5hex(valuesConcat) + _MD5_SALT);
+}
+
+/**
+ * Compute sign from a JSON body string.
+ * Keys are sorted alphabetically; each value is stringified (not quoted).
+ * Nested objects are not expanded — only top-level values.
+ *
+ * Large integers (≥16 digits, e.g. memberId > MAX_SAFE_INTEGER) are wrapped in
+ * quotes BEFORE JSON.parse so their precision is preserved — otherwise JS
+ * silently rounds them and the computed sign won't match Hot51's expectation.
+ */
+function signForBody(body: string): string {
+  if (!body || body === "{}") return computeSign("");
+  try {
+    // Wrap bare integers ≥ 16 digits in quotes to survive JSON.parse precision loss
+    const safeBody = body.replace(/:\s*(-?\d{16,})(\s*[,}])/g, ':"$1"$2');
+    const obj = JSON.parse(safeBody) as Record<string, unknown>;
+    const sortedKeys = Object.keys(obj).sort();
+    const concat = sortedKeys.map(k => String(obj[k])).join("");
+    return computeSign(concat);
+  } catch {
+    return computeSign("");
+  }
+}
+
+/**
+ * Compute sign from a URL with query parameters.
+ * Param names are sorted alphabetically; only values are concatenated.
+ */
+function signForUrl(url: string): string {
+  try {
+    const parsed = new URL(url.startsWith("http") ? url : `https://x.com${url}`);
+    const params = parsed.searchParams;
+    const names = [...params.keys()].sort();
+    const concat = names.map(k => params.get(k) ?? "").join("");
+    return computeSign(concat);
+  } catch {
+    return computeSign("");
+  }
+}
+
+// POST request headers base — sign is always set dynamically per-request
 const POST_HEADERS: Record<string, string> = {
   ...BASE_HEADERS,
   Authorization: APP_BASIC_AUTH,
   "Content-Type": "application/json",
-  sign: SIGN_EMPTY_BODY,
+  sign: computeSign(""),
 };
 
 // OTP/login endpoints use Basic auth only for token endpoint
@@ -256,11 +298,21 @@ const OTP_HEADERS: Record<string, string> = {
   ...POST_HEADERS,
 };
 
-/** Add ?t=<unix_timestamp> to a URL (required by HOT51 GET endpoints) */
+/**
+ * Add ?t=<unix_timestamp> to a URL (required by HOT51 GET endpoints).
+ * Returns both the stamped URL and its computed sign.
+ */
 function withTimestamp(url: string): string {
   const t = Math.floor(Date.now() / 1000);
   const sep = url.includes("?") ? "&" : "?";
   return `${url}${sep}t=${t}`;
+}
+
+/** Build a stamped URL and return {url, sign} for GET requests */
+function withTimestampAndSign(url: string): { url: string; sign: string } {
+  const stamped = withTimestamp(url);
+  const sign = signForUrl(stamped);
+  return { url: stamped, sign };
 }
 
 interface Session {
@@ -308,14 +360,15 @@ if (process.env.HOT51_AC && process.env.HOT51_SIGN) {
   };
 }
 
-/** Headers for GET requests (no Authorization, no Content-Type) */
-function getGuestGetHeaders(): Record<string, string> {
-  return APP_HEADERS;
+/** Headers for GET requests — includes computed sign from URL */
+function getGuestGetHeaders(url?: string): Record<string, string> {
+  const sign = url ? signForUrl(url) : computeSign("");
+  return { ...APP_HEADERS, sign };
 }
 
 /** Headers for POST requests (includes Authorization: Basic, Content-Type, body-aware sign) */
 function getPostHeaders(body?: string): Record<string, string> {
-  const sign = session ? session.sign : signForBody(body ?? "");
+  const sign = signForBody(body ?? "");
   if (!session) return { ...POST_HEADERS, sign };
   return {
     ...POST_HEADERS,
@@ -325,12 +378,14 @@ function getPostHeaders(body?: string): Record<string, string> {
   };
 }
 
-/** Headers for user-authenticated endpoints (toy/send, toy/list) — uses Bearer JWT */
-function getBearerHeaders(body?: string): Record<string, string> {
-  // bearerToken: the JWT used for Authorization header
+/**
+ * Headers for user-authenticated endpoints (toy/send, toy/list) — uses Bearer JWT.
+ * @param bodyOrUrl  For POST: JSON body string. For GET: pass the full URL.
+ * @param isGetUrl   Set true when bodyOrUrl is a URL (GET request sign).
+ */
+function getBearerHeaders(bodyOrUrl?: string, isGetUrl = false): Record<string, string> {
   const bearerToken = session?.token ?? (session?.sign?.startsWith("eyJ") ? session.sign : null);
-  // sign: always derive from body HMAC, never use the JWT as the sign header
-  const sign = signForBody(body ?? "");
+  const sign = isGetUrl ? signForUrl(bodyOrUrl ?? "") : signForBody(bodyOrUrl ?? "");
   const h: Record<string, string> = {
     ...BASE_HEADERS,
     username: session?.username ?? "",
@@ -338,9 +393,9 @@ function getBearerHeaders(body?: string): Record<string, string> {
     sign,
   };
   if (bearerToken) h["Authorization"] = `Bearer ${bearerToken}`;
-  if (body) {
+  if (bodyOrUrl && !isGetUrl) {
     h["Content-Type"] = "application/json; charset=utf-8";
-    h["Content-Length"] = String(Buffer.byteLength(body, "utf-8"));
+    h["Content-Length"] = String(Buffer.byteLength(bodyOrUrl, "utf-8"));
   }
   return h;
 }
@@ -662,7 +717,8 @@ async function fetchAnchorIds(area = "ID", pageSize = 100): Promise<Array<{ aid:
   const allAids = new Map<string, { aid: string; area: string }>();
   for (const ep of endpoints) {
     try {
-      const raw = await hotFetch(withTimestamp(ep), { method: "GET", headers: getGuestGetHeaders(), timeoutMs: 12_000 });
+      const stamped = withTimestamp(ep);
+      const raw = await hotFetch(stamped, { method: "GET", headers: getGuestGetHeaders(stamped), timeoutMs: 12_000 });
       const data = unwrapHot51(raw);
       const list = Array.isArray(data) ? data : (data as Record<string, unknown>)?.list as unknown[] ?? [];
       for (const item of (Array.isArray(list) ? list : []) as Array<{ aid: string; area: string }>) {
@@ -2096,7 +2152,7 @@ liveRouter.get("/gifts", async (_req: Request, res: Response) => {
   ];
   for (const url of getEndpoints) {
     try {
-      const raw = await hotFetch(url, { method: "GET", headers: getGuestGetHeaders(), timeoutMs: 10_000 });
+      const raw = await hotFetch(url, { method: "GET", headers: getGuestGetHeaders(url), timeoutMs: 10_000 });
       const d = raw as Record<string, unknown>;
       if (d?.code === 200 || d?.code === "200") {
         const inner = d.data;
@@ -2423,7 +2479,7 @@ liveRouter.get("/toys", async (_req: Request, res: Response) => {
     const data = await Promise.race([
       hotFetch(toyListUrl, {
         method: "GET",
-        headers: getBearerHeaders(),
+        headers: getBearerHeaders(toyListUrl, true),
         timeoutMs: 6_000,
       }),
       new Promise<never>((_, reject) =>

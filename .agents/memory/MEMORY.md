@@ -1,0 +1,1 @@
+- [Hot51 Sign Algorithm](hot51-sign.md) — salt + double-MD5 sign, precision fix for large memberId integers
