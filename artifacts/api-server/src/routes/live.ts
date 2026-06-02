@@ -1205,7 +1205,16 @@ liveRouter.get("/live-rooms", async (req: Request, res: Response) => {
 
   try {
     const { rooms, total } = await fetchLiveRooms();
-    const sliced = rooms.slice(offset, offset + limit).map(r => ({
+    // Sort: cdnsi.com (Volcengine) rooms first — they don't geo-block this server.
+    // livcdn.com (Tencent) rooms often 403 from US IPs and can have expired txTime tokens,
+    // causing the player to hang for 45+ seconds retrying. Moving them to the end means
+    // users see working streams immediately.
+    const sorted = [...rooms].sort((a, b) => {
+      const aOk = (a.streamUrl || a.hlsUrl || "").includes("cdnsi.com");
+      const bOk = (b.streamUrl || b.hlsUrl || "").includes("cdnsi.com");
+      return aOk === bOk ? 0 : aOk ? -1 : 1;
+    });
+    const sliced = sorted.slice(offset, offset + limit).map(r => ({
       ...r,
       hasAuth: !!session,
     }));

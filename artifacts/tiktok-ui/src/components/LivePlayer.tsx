@@ -207,16 +207,16 @@ export default function LivePlayer({
       liveMaxLatencyDurationCount: 6,
       maxBufferLength: 12,
       maxMaxBufferLength: 30,
-      enableWorker: true,
-      manifestLoadingTimeOut: 13_000,
-      manifestLoadingMaxRetry: 2,
-      fragLoadingMaxRetry: 6,
-      fragLoadingRetryDelay: 800,
+      // enableWorker:false — Replit preview iframe blocks blob: Web Workers (CSP).
+      // With the worker enabled, HLS.js silently fails to create the transmuxer thread
+      // and MANIFEST_PARSED never fires. Main-thread transmuxing works fine here.
+      enableWorker: false,
+      manifestLoadingTimeOut: 15_000,
+      manifestLoadingMaxRetry: 3,
+      fragLoadingTimeOut: 20_000,
+      fragLoadingMaxRetry: 4,
+      fragLoadingRetryDelay: 1000,
       liveBackBufferLength: 0,
-      // Explicit default codecs — prevents bufferAddCodecError when HLS.js can't
-      // determine the codec from the first segment before creating the SourceBuffer.
-      // Hot51 streams are H.264/AVC video + AAC audio (confirmed from MPEG-TS PMT).
-      defaultAudioCodec: "mp4a.40.2",
       xhrSetup: (_xhr: XMLHttpRequest, xhrUrl: string) => {
         console.info("[LivePlayer] XHR →", xhrUrl.substring(0, 80));
       },
@@ -228,15 +228,19 @@ export default function LivePlayer({
     hls.loadSource(url);
     hls.attachMedia(el);
 
-    hls.on(Hls.Events.MANIFEST_PARSED, () => {
-      console.info("[LivePlayer] MANIFEST_PARSED — play()");
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+      console.info("[LivePlayer] MEDIA_ATTACHED");
+    });
+
+    hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
+      console.info("[LivePlayer] MANIFEST_PARSED — levels:", data.levels?.length, "— play()");
       setState("playing");
       setMode("hls");
       el.play().catch((e) => console.warn("[LivePlayer] play() rejected:", e));
     });
 
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      console.warn("[LivePlayer] HLS error:", data.details, "fatal:", data.fatal, "type:", data.type);
+      console.warn("[LivePlayer] HLS error:", data.details, "fatal:", data.fatal, "type:", data.type, data.error?.message ?? "");
       if (data.fatal) {
         destroyHls();
         // bufferAddCodecError = MSE SourceBuffer.addSourceBuffer() failed — browser-side issue,
