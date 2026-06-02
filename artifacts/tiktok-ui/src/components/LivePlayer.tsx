@@ -476,6 +476,43 @@ export default function LivePlayer({
     ? "Memuat HLS…"
     : "Menghubungkan…";
 
+  // Show FLV/HLS switcher only when both URLs are available
+  const flvUrl = streamUrl ? toAbsoluteUrl(streamUrl) : "";
+  const hasFLV = flvUrl.endsWith(".flv") || flvUrl.includes(".flv?");
+  const hasHLS = !!(hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null));
+  const showSwitcher = hasFLV && hasHLS && (state === "playing" || state === "loading") && mode !== "zego";
+
+  function handleSwitchMode(target: "flv" | "hls") {
+    if (!videoEl) return;
+    destroyAll();
+    try { videoEl.srcObject = null; } catch { /* ignore */ }
+    // Reset all tried-refs so the target format gets a clean attempt
+    flvTriedRef.current = false;
+    hlsTriedRef.current = false;
+    proxyFallbackTriedRef.current = false;
+
+    if (target === "flv") {
+      hlsFallbackRef.current = hlsUrl
+        ? (isHot51Cdn(toAbsoluteUrl(hlsUrl)) && anchorId
+            ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
+            : toAbsoluteUrl(hlsUrl))
+        : "";
+      startFlv(flvUrl, videoEl);
+    } else {
+      const rawHls = hlsUrl
+        ? toAbsoluteUrl(hlsUrl)
+        : streamUrl?.replace(".flv", ".m3u8") ?? "";
+      if (isHot51Cdn(rawHls) && rawHls.includes(".m3u8")) {
+        proxyFallbackRef.current = anchorId
+          ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
+          : `${BASE}/api/hls-proxy?url=${encodeURIComponent(rawHls)}`;
+        startHls(rawHls, videoEl);
+      } else if (rawHls) {
+        startHls(toHlsProxyUrl(rawHls), videoEl);
+      }
+    }
+  }
+
   return (
     <div ref={containerRef} className={`relative w-full h-full bg-black overflow-hidden ${className}`}>
       {cover && state !== "playing" && (
@@ -556,8 +593,38 @@ export default function LivePlayer({
               </svg>
             )}
           </button>
-          {modeBadge && (
-            <span className="text-[9px] text-white/60 font-mono">{modeBadge}</span>
+
+          {/* FLV / HLS manual switcher */}
+          {showSwitcher ? (
+            <div
+              className="flex rounded-full overflow-hidden"
+              style={{ border: "1px solid rgba(255,255,255,0.18)", background: "rgba(0,0,0,0.55)", backdropFilter: "blur(6px)" }}
+            >
+              <button
+                onClick={() => handleSwitchMode("flv")}
+                title="HTTP-FLV — latensi rendah ~1-3 detik"
+                className="px-2 py-[3px] text-[8px] font-mono font-bold transition-colors active:opacity-70"
+                style={mode === "flv"
+                  ? { background: "#EE1D52", color: "#fff" }
+                  : { color: "rgba(255,255,255,0.45)" }}
+              >
+                FLV
+              </button>
+              <button
+                onClick={() => handleSwitchMode("hls")}
+                title="HLS M3U8 — kompatibel & adaptif"
+                className="px-2 py-[3px] text-[8px] font-mono font-bold transition-colors active:opacity-70"
+                style={mode === "hls"
+                  ? { background: "#EE1D52", color: "#fff" }
+                  : { color: "rgba(255,255,255,0.45)" }}
+              >
+                HLS
+              </button>
+            </div>
+          ) : (
+            modeBadge && (
+              <span className="text-[9px] text-white/60 font-mono">{modeBadge}</span>
+            )
           )}
         </div>
       )}
