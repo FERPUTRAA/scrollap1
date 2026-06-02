@@ -249,6 +249,7 @@ export default function LivePlayer({
         // For network/CORS/geo-block: try proxy first, then FLV (if not tried), then Zego
         if (proxyFallbackRef.current && !proxyFallbackTriedRef.current) {
           proxyFallbackTriedRef.current = true;
+          hlsTriedRef.current = false; // reset so startHls can actually run HLS again with proxy URL
           console.info("[LivePlayer] HLS direct fatal → retrying via proxy");
           startHls(proxyFallbackRef.current, el);
         } else if (!flvTriedRef.current && streamUrl) {
@@ -327,26 +328,25 @@ export default function LivePlayer({
 
     if (rawFlv && (rawFlv.endsWith(".flv") || rawFlv.includes(".flv?"))) {
       // ── FLV-first: HTTP-FLV ~1-3s latency ──
-      // Pre-load HLS fallback URL into ref so startFlv's error handler can use it
-      // without circular dependency
+      // Always set HLS proxy as fallback for FLV failure
       if (rawHls && rawHls.includes(".m3u8")) {
-        const hlsProxy = hlsIsCdn
-          ? (anchorId
-              ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
-              : `${BASE}/api/hls-proxy?url=${encodeURIComponent(rawHls)}`)
-          : rawHls;
+        const hlsProxy = anchorId
+          ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
+          : (hlsIsCdn
+              ? `${BASE}/api/hls-proxy?url=${encodeURIComponent(rawHls)}`
+              : rawHls);
         hlsFallbackRef.current = hlsProxy;
-        // Also set proxyFallbackRef for HLS-level retry
         proxyFallbackRef.current = hlsProxy;
         proxyFallbackTriedRef.current = false;
       } else {
         hlsFallbackRef.current = "";
       }
 
-      if (flvIsCdn) {
-        // Hot51 CDN FLV: direct first (fast for Indonesian users)
-        console.info("[LivePlayer] FLV loadSource (direct):", rawFlv.substring(0, 100));
-        startFlv(rawFlv, el);
+      if (flvIsCdn && anchorId) {
+        // Hot51 CDN FLV: route through server-side stream-proxy to avoid 403/geo-block
+        const sp = `${BASE}/api/stream-proxy?roomId=${encodeURIComponent(roomId)}&anchorId=${encodeURIComponent(anchorId)}${liveId ? `&liveId=${encodeURIComponent(liveId)}` : ""}`;
+        console.info("[LivePlayer] FLV via stream-proxy:", sp.substring(0, 80));
+        startFlv(sp, el);
       } else {
         startFlv(rawFlv, el);
       }
@@ -354,11 +354,11 @@ export default function LivePlayer({
       // HLS-only stream (no FLV URL available)
       const url = rawHls || rawFlv;
       if (isHot51Cdn(url) && url.includes(".m3u8")) {
-        proxyFallbackRef.current = anchorId
+        // Always use proxy for Hot51 CDN HLS — avoids 403 from expired tokens/geo-block
+        const proxyUrl = anchorId
           ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
           : `${BASE}/api/hls-proxy?url=${encodeURIComponent(url)}`;
-        proxyFallbackTriedRef.current = false;
-        startHls(url, el);
+        startHls(proxyUrl, el);
       } else {
         startHls(toHlsProxyUrl(url), el);
       }
@@ -366,7 +366,7 @@ export default function LivePlayer({
       tryProxy(el);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hlsUrl, streamUrl, anchorId, startFlv, startHls, tryProxy]);
+  }, [hlsUrl, streamUrl, anchorId, liveId, roomId, startFlv, startHls, tryProxy]);
 
   const handleZegoPlaying = useCallback(() => {
     setMode("zego");
@@ -493,20 +493,27 @@ export default function LivePlayer({
 
     if (target === "flv") {
       hlsFallbackRef.current = hlsUrl
-        ? (isHot51Cdn(toAbsoluteUrl(hlsUrl)) && anchorId
+        ? (anchorId
             ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
             : toAbsoluteUrl(hlsUrl))
         : "";
-      startFlv(flvUrl, videoEl);
+      if (isHot51Cdn(flvUrl) && anchorId) {
+        // CDN FLV: route through stream-proxy to avoid 403/geo-block
+        const sp = `${BASE}/api/stream-proxy?roomId=${encodeURIComponent(roomId)}&anchorId=${encodeURIComponent(anchorId)}${liveId ? `&liveId=${encodeURIComponent(liveId)}` : ""}`;
+        startFlv(sp, videoEl);
+      } else {
+        startFlv(flvUrl, videoEl);
+      }
     } else {
       const rawHls = hlsUrl
         ? toAbsoluteUrl(hlsUrl)
         : streamUrl?.replace(".flv", ".m3u8") ?? "";
       if (isHot51Cdn(rawHls) && rawHls.includes(".m3u8")) {
-        proxyFallbackRef.current = anchorId
+        // Always use proxy for Hot51 CDN HLS — avoids 403 from expired tokens/geo-block
+        const proxyUrl = anchorId
           ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
           : `${BASE}/api/hls-proxy?url=${encodeURIComponent(rawHls)}`;
-        startHls(rawHls, videoEl);
+        startHls(proxyUrl, videoEl);
       } else if (rawHls) {
         startHls(toHlsProxyUrl(rawHls), videoEl);
       }
