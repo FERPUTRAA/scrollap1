@@ -1,1 +1,2 @@
 - [Hot51 Sign Algorithm](hot51-sign.md) — salt + double-MD5 sign, precision fix for large memberId integers
+- [Hot51 IP_LIMIT bypass strategy](hot51-ip-limit.md) — GET /lids needs minimal okhttp headers; POST endpoints need CF Worker Mode 3 proxy

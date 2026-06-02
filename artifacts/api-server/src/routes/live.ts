@@ -725,6 +725,21 @@ function unwrapHot51(data: unknown): unknown {
   return data;
 }
 
+/**
+ * Minimal headers for GET /lids endpoints — okhttp UA + ac only.
+ * IMPORTANT: Full APK Cronet headers (client-type, versionCode, dev-type, etc.) trigger
+ * IP_LIMIT (G10001) on /lids GET endpoints from non-Indonesian IPs. Minimal okhttp headers
+ * bypass this check. Never use APP_HEADERS / getGuestGetHeaders() for /lids calls.
+ */
+function getLidsHeaders(): Record<string, string> {
+  return {
+    merchantId: MERCHANT_ID,
+    ac: GUEST_AC,
+    "User-Agent": "okhttp/4.12.0",
+    Accept: "*/*",
+  };
+}
+
 /** Fetch anchor IDs from the working GET /lids endpoint (no auth required) */
 async function fetchAnchorIds(area = "ID", pageSize = 100): Promise<Array<{ aid: string; area: string }>> {
   // Try multiple lids endpoints — no labelId filter to get ALL live rooms, not just featured
@@ -739,11 +754,14 @@ async function fetchAnchorIds(area = "ID", pageSize = 100): Promise<Array<{ aid:
     `${HOT51_BASE}/${MERCHANT_ID}/api${API.liveCenterLids}?merchantId=${MERCHANT_ID}&memArea=${area}&pageSize=${pageSize}&pageNum=2`,
   ];
 
+  // Use minimal headers — full Cronet APK headers trigger IP_LIMIT on /lids GET endpoints
+  const lidsHeaders = getLidsHeaders();
+
   const allAids = new Map<string, { aid: string; area: string }>();
   for (const ep of endpoints) {
     try {
       const stamped = withTimestamp(ep);
-      const raw = await hotFetch(stamped, { method: "GET", headers: getGuestGetHeaders(stamped), timeoutMs: 12_000 });
+      const raw = await hotFetch(stamped, { method: "GET", headers: lidsHeaders, timeoutMs: 12_000 });
       const data = unwrapHot51(raw);
       const list = Array.isArray(data) ? data : (data as Record<string, unknown>)?.list as unknown[] ?? [];
       for (const item of (Array.isArray(list) ? list : []) as Array<{ aid: string; area: string }>) {
@@ -757,12 +775,13 @@ async function fetchAnchorIds(area = "ID", pageSize = 100): Promise<Array<{ aid:
 /** Fetch cover URLs for a batch of anchor IDs using swipeSwitch */
 async function fetchSwipeSwitchBatch(anchorId: string, type = 0): Promise<Array<{ anchorId: string; coverUrl: string; living: boolean }>> {
   const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.swipeSwitch}`);
-  const raw = await hotFetch(url, {
-    method: "POST",
-    headers: getPostHeaders(),
-    body: JSON.stringify({ anchorId, type }),
-    timeoutMs: 10_000,
-  });
+  const body = JSON.stringify({ anchorId, type });
+  const headers = getPostHeaders(body);
+  // Try CF Worker first to bypass geo-IP block; fall back to direct
+  let raw: unknown = await cfWorkerPost(url, headers, body, 10_000);
+  if (!raw || isIpLimitResponse(raw)) {
+    raw = await hotFetch(url, { method: "POST", headers, body, timeoutMs: 10_000 });
+  }
   const data = unwrapHot51(raw);
   if (Array.isArray(data)) return data as Array<{ anchorId: string; coverUrl: string; living: boolean }>;
   return [];
@@ -813,6 +832,26 @@ interface RoomInfoResult {
   gameName?: string;    // gn = game being played
 }
 
+/**
+ * Try a POST request via CF Worker /api?url= proxy.
+ * Forwards all headers so Cloudflare's non-US IP bypasses Hot51's geo-block.
+ * Returns parsed JSON or null on failure.
+ */
+async function cfWorkerPost(
+  targetUrl: string,
+  headers: Record<string, string>,
+  body: string,
+  timeoutMs = 8_000,
+): Promise<unknown> {
+  if (!CF_WORKER_URL) return null;
+  try {
+    const proxyUrl = `${CF_WORKER_URL}/api?url=${encodeURIComponent(targetUrl)}`;
+    return await attemptFetch(proxyUrl, { method: "POST", headers, body }, undefined, timeoutMs);
+  } catch {
+    return null;
+  }
+}
+
 /** Fetch real room metadata from room-info API */
 async function fetchRoomInfo(anchorId: string): Promise<RoomInfoResult | null> {
   const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getRoomInfo}`);
@@ -821,12 +860,17 @@ async function fetchRoomInfo(anchorId: string): Promise<RoomInfoResult | null> {
   // causing bufferAddCodecError. Only Safari on macOS/iOS supports H.265 via MSE.
   const body = JSON.stringify({ anchorId, isSupportH265: false, spH5: 1 });
   try {
-    const raw = await hotFetch(url, {
-      method: "POST",
-      headers: getPostHeaders(body),
-      body,
-      timeoutMs: 8_000,
-    });
+    const headers = getPostHeaders(body);
+    // Try CF Worker first (2s timeout) — its non-US IP bypasses G10001 geo-block.
+    // CF Worker Mode 3 (/api?url=) must be deployed for this to succeed.
+    // Falls back to direct if CF Worker returns no useful data.
+    let raw: unknown = await cfWorkerPost(url, headers, body, 2_000);
+    const cfRoomData = raw ? (unwrapHot51(raw) as Record<string, unknown> | null) : null;
+    const cfHasData = cfRoomData && (cfRoomData.ann || cfRoomData.lid || cfRoomData.unlDefPa);
+    if (!cfHasData) {
+      // Direct call — will get G10001 from US IP, but at least records get liveId=anchorId fallback
+      raw = await hotFetch(url, { method: "POST", headers, body, timeoutMs: 4_000 });
+    }
     const d = unwrapHot51(raw) as Record<string, unknown>;
     if (!d || typeof d !== "object" || Array.isArray(d)) return null;
     const liveId = (d.lid as string) || anchorId;
@@ -965,7 +1009,7 @@ async function fetchLiveRooms(): Promise<{ rooms: ProcessedRoom[]; total: number
       // Parallel: get covers (swipeSwitch) + enrich up to 60 rooms with room-info for real stream URLs
       const [coverMap, enrichedRecords] = await Promise.all([
         buildCoverMap(allAnchors.map(a => a.aid)).catch(() => new Map<string, string>()),
-        enrichRooms(baseRecords, 60).catch(() => baseRecords),
+        enrichRooms(baseRecords, 20).catch(() => baseRecords),
       ]);
 
       // Apply cover map to all records
