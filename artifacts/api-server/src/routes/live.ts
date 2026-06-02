@@ -1496,6 +1496,40 @@ liveRouter.get("/api-info", (_req: Request, res: Response) => {
   });
 });
 
+/**
+ * GET /hot51-config
+ * Returns configuration needed for browser-side CF Worker calls.
+ * Browser uses this to call CF Worker /api?url= directly (Indonesian edge → no IP_LIMIT).
+ */
+liveRouter.get("/hot51-config", (_req: Request, res: Response) => {
+  res.json({
+    cfWorkerUrl: CF_WORKER_URL || null,
+    ac: session?.ac ?? GUEST_AC,
+    authToken: session?.sign ?? null,
+    merchantId: MERCHANT_ID,
+    basicAuth: APP_BASIC_AUTH,
+    aesKey: HOT51_ROOM_URL_KEY,
+    aesIv: HOT51_ROOM_URL_IV,
+    roomInfoPath: API.getRoomInfo,
+    apiBase: `${HOT51_BASE}/${MERCHANT_ID}/api`,
+  });
+});
+
+/**
+ * POST /hot51-sign
+ * Computes Hot51 request body signature server-side (keeps SALT secret).
+ * Body: { bodyStr: string }
+ * Response: { sign: string }
+ */
+liveRouter.post("/hot51-sign", (req: Request, res: Response) => {
+  const { bodyStr } = req.body as { bodyStr?: string };
+  if (typeof bodyStr !== "string") {
+    res.status(400).json({ error: "bodyStr required" });
+    return;
+  }
+  res.json({ sign: signForBody(bodyStr) });
+});
+
 /** POST /live-next — get next live room using APK scrolliv/live/next then swipe-switch
  *  Confirmed body format from real APK traffic capture:
  *    scrolliv/live/next: {"aid": anchorId, "isSupportH265": true}   ← "aid" not "anchorId"!

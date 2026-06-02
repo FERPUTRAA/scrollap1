@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { RefreshCw, Radio, WifiOff, User } from "lucide-react";
 import VideoCard from "../components/VideoCard";
 import LoginModal from "../components/LoginModal";
+import { useRoomEnrich } from "../hooks/useRoomEnrich";
 
 interface LiveRoom {
   id: string;
@@ -102,6 +103,7 @@ export default function Feed() {
   const [session, setSession] = useState<SessionStatus>({ loggedIn: false });
   const [loadingMore, setLoadingMore] = useState(false);
   const currentAnchorRef = useRef<string>("");
+  const { enrich, enrichedRooms } = useRoomEnrich();
 
   const checkSession = useCallback(async () => {
     try {
@@ -221,6 +223,40 @@ export default function Feed() {
     checkSession();
     fetchRooms();
   }, [checkSession, fetchRooms]);
+
+  useEffect(() => {
+    if (videos.length === 0) return;
+    const ids = videos
+      .map(v => v.anchorId)
+      .filter((id): id is string => !!id)
+      .slice(0, 30);
+    if (ids.length > 0) enrich(ids);
+  }, [videos.length, enrich]);
+
+  useEffect(() => {
+    if (enrichedRooms.size === 0) return;
+    setVideos(prev =>
+      prev.map(v => {
+        const e = v.anchorId ? enrichedRooms.get(v.anchorId) : undefined;
+        if (!e) return v;
+        return {
+          ...v,
+          username: e.name || v.username,
+          handle: e.name ? (e.name.replace(/[^\w\u00C0-\u024F\u1E00-\u1EFF]/gu, "").replace(/^_+|_+$/g, "") || "hot51") : v.handle,
+          caption: e.liveName || e.name || v.caption,
+          likes: e.viewers ? formatCount(e.viewers) : v.likes,
+          comments: e.viewers ? formatCount(Math.max(0, Math.floor(e.viewers * 0.06))) : v.comments,
+          bgColor: e.cover ? undefined : v.bgColor,
+          coverUrl: e.cover || v.coverUrl,
+          avatarUrl: e.avatar || v.avatarUrl,
+          hlsUrl: e.hlsUrl || v.hlsUrl,
+          streamUrl: e.pullAddr || v.streamUrl,
+          liveId: e.liveId || v.liveId,
+          viewers: e.viewers ?? v.viewers,
+        };
+      })
+    );
+  }, [enrichedRooms]);
 
   /** Called by VideoCard when user swipes to last card — load more rooms */
   const handleNearEnd = useCallback((currentId: string) => {

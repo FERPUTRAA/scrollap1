@@ -20,7 +20,18 @@ Hot51's geo-block (G10001 `IP_LIMIT`) behaves differently depending on HTTP meth
 ## Fix Applied
 `getLidsHeaders()` function uses minimal headers for `/lids` GET calls. Never use `APP_HEADERS` or `getGuestGetHeaders()` for `/lids`.
 
-## CF Worker Mode 3
-Added `/api?url=` endpoint to `cloudflare-worker/hot51-proxy.js` that forwards all headers + method + body. Must be deployed by user to enable POST API proxying (room-info, swipeSwitch, toy/send).
+## CF Worker Mode 3 (server-side) — still G10001
+CF Worker `/api?url=` IS deployed. But when Replit server (US) calls CF Worker, Cloudflare picks up the request at a US PoP → upstream to Hot51 from US IP → still G10001. Not a code problem, a geography problem.
 
-**How to apply:** For any POST endpoint that gets G10001, use `cfWorkerPost(url, headers, body)` first, fall back to direct only if CF Worker returns no useful data (no `ann`/`lid`/`unlDefPa` fields).
+## Browser-side enrichment (SOLUTION)
+Added `/api/hot51-config` and `/api/hot51-sign` endpoints. Browser hook `useRoomEnrich.ts` calls CF Worker `/api?url=room-info` DIRECTLY from the user's browser (Indonesia) → CF Worker uses Indonesian PoP → no IP_LIMIT → real name/cover/stream URL.
+
+**Key endpoints:**
+- `GET /api/hot51-config` → returns cfWorkerUrl, ac, authToken, aesKey, aesIv, roomInfoPath
+- `POST /api/hot51-sign` → takes `{bodyStr}`, returns `{sign}` (SALT kept server-side)
+
+**Hook:** `artifacts/tiktok-ui/src/hooks/useRoomEnrich.ts`
+- Uses Web Crypto AES-CBC to decrypt `unlDefPa` (key=`star@livega*963.`, iv=`0608040307010502`)
+- `doneIds` ref prevents duplicate enrichment calls (stable `useCallback` dep)
+
+**Why it works:** CF Worker uses the nearest PoP to the REQUEST ORIGINATOR. Browser in Indonesia → Indonesian CF PoP → Hot51 accepts request.
