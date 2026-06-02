@@ -2076,9 +2076,17 @@ liveRouter.get("/hls-proxy", async (req: Request, res: Response) => {
 
   req.log.info({ url: usedUrl }, "hls-proxy: got manifest");
 
+  // LL-HLS tags that reference un-proxied relative URIs or signal blocking reload.
+  // Stripping them converts the manifest to standard HLS so HLS.js (lowLatencyMode:false)
+  // can parse it without trying to fetch un-proxied partial-segment URIs.
+  const LL_HLS_STRIP = ["#EXT-X-PART:", "#EXT-X-PART-INF:", "#EXT-X-SERVER-CONTROL:", "#EXT-X-PRELOAD-HINT:"];
+
   // Rewrite each line: absolute URLs and relative paths → ts-proxy
   const baseUrl = usedUrl.substring(0, usedUrl.lastIndexOf("/") + 1);
-  const rewritten = manifestText.split("\n").map(line => {
+  const rewritten = manifestText.split("\n").filter(line => {
+    const t = line.trim();
+    return !LL_HLS_STRIP.some(tag => t.startsWith(tag));
+  }).map(line => {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) return line;
     let absUrl: string;

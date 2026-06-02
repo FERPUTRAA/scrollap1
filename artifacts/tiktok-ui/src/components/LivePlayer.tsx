@@ -476,11 +476,15 @@ export default function LivePlayer({
     ? "Memuat HLS…"
     : "Menghubungkan…";
 
-  // Show FLV/HLS switcher only when both URLs are available
+  // FLV/HLS switcher: show whenever anchorId is available so user can switch between
+  // stream-proxy (FLV-style binary pipe) and hls-proxy (segment-based HLS).
+  // Not all rooms have a native .flv URL — Hot51 often only provides .m3u8 — so we
+  // derive FLV capability from the stream-proxy endpoint which always works for any room.
   const flvUrl = streamUrl ? toAbsoluteUrl(streamUrl) : "";
-  const hasFLV = flvUrl.endsWith(".flv") || flvUrl.includes(".flv?");
-  const hasHLS = !!(hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null));
-  const showSwitcher = hasFLV && hasHLS && (state === "playing" || state === "loading") && mode !== "zego";
+  const isNativeFLV = flvUrl.endsWith(".flv") || flvUrl.includes(".flv?");
+  const canFLV = isNativeFLV || !!anchorId; // stream-proxy works for any room with anchorId
+  const hasHLS = !!(hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null)) || !!anchorId;
+  const showSwitcher = canFLV && hasHLS && (state === "playing" || state === "loading") && mode !== "zego";
 
   function handleSwitchMode(target: "flv" | "hls") {
     if (!videoEl) return;
@@ -492,16 +496,14 @@ export default function LivePlayer({
     proxyFallbackTriedRef.current = false;
 
     if (target === "flv") {
-      hlsFallbackRef.current = hlsUrl
-        ? (anchorId
-            ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
-            : toAbsoluteUrl(hlsUrl))
-        : "";
-      if (isHot51Cdn(flvUrl) && anchorId) {
-        // CDN FLV: route through stream-proxy to avoid 403/geo-block
+      hlsFallbackRef.current = anchorId
+        ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
+        : (hlsUrl ? toAbsoluteUrl(hlsUrl) : "");
+      // Always use stream-proxy for CDN streams or when no native .flv URL
+      if (anchorId && (isHot51Cdn(flvUrl) || !isNativeFLV)) {
         const sp = `${BASE}/api/stream-proxy?roomId=${encodeURIComponent(roomId)}&anchorId=${encodeURIComponent(anchorId)}${liveId ? `&liveId=${encodeURIComponent(liveId)}` : ""}`;
         startFlv(sp, videoEl);
-      } else {
+      } else if (isNativeFLV) {
         startFlv(flvUrl, videoEl);
       }
     } else {
