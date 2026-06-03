@@ -57,13 +57,11 @@ export default function LivePlayer({
   const zegoTriedRef = useRef(false);
   const hlsTriedRef = useRef(false);
   const flvTriedRef = useRef(false);
+  // Track the URL currently loaded by HLS.js so we can detect token refreshes
   const activeHlsSourceRef = useRef<string>("");
+  // Proxy URL to retry if direct CDN access fails (CORS/geo-block)
   const proxyFallbackRef = useRef<string>("");
   const proxyFallbackTriedRef = useRef(false);
-  // HLS URL to try if FLV fails — set by startCdn before calling startFlv
-  const hlsFallbackRef = useRef<string>("");
-  // Ref to startHls to break the startFlv ↔ startHls circular dep
-  const startHlsRef = useRef<((url: string, el: HTMLVideoElement) => void) | null>(null);
 
   useEffect(() => {
     const el = containerRef.current;
@@ -141,13 +139,7 @@ export default function LivePlayer({
 
     player.on(mpegts.Events.ERROR, () => {
       destroyFlv();
-      // FLV failed → try HLS fallback if available and not yet tried
-      const hlsFallback = hlsFallbackRef.current;
-      if (!hlsTriedRef.current && hlsFallback && startHlsRef.current) {
-        startHlsRef.current(hlsFallback, el);
-      } else {
-        startZego();
-      }
+      startZego();
     });
 
     player.on(mpegts.Events.MEDIA_INFO, () => {
@@ -160,12 +152,7 @@ export default function LivePlayer({
 
   const startHls = useCallback((url: string, el: HTMLVideoElement) => {
     if (hlsTriedRef.current) {
-      // HLS already tried → FLV as last CDN attempt (if not tried yet), else Zego
-      if (!flvTriedRef.current) {
-        const flvUrl = streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv");
-        if (flvUrl) { startFlv(flvUrl, el); return; }
-      }
-      startZego();
+      startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
       return;
     }
     destroyAll();
@@ -180,21 +167,13 @@ export default function LivePlayer({
       el.play().catch(() => {});
       el.onloadeddata = () => { setState("playing"); setMode("hls"); };
       el.onerror = () => {
-        if (!flvTriedRef.current) {
-          startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
-        } else {
-          startZego();
-        }
+        startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : url.replace(".m3u8", ".flv"), el);
       };
       return;
     }
 
     if (!Hls.isSupported()) {
-      if (!flvTriedRef.current && streamUrl) {
-        startFlv(toAbsoluteUrl(streamUrl), el);
-      } else {
-        startZego();
-      }
+      startFlv(streamUrl ? toAbsoluteUrl(streamUrl) : "", el);
       return;
     }
 
@@ -207,16 +186,16 @@ export default function LivePlayer({
       liveMaxLatencyDurationCount: 6,
       maxBufferLength: 12,
       maxMaxBufferLength: 30,
-      // enableWorker:false — Replit preview iframe blocks blob: Web Workers (CSP).
-      // With the worker enabled, HLS.js silently fails to create the transmuxer thread
-      // and MANIFEST_PARSED never fires. Main-thread transmuxing works fine here.
-      enableWorker: false,
-      manifestLoadingTimeOut: 15_000,
-      manifestLoadingMaxRetry: 3,
-      fragLoadingTimeOut: 20_000,
-      fragLoadingMaxRetry: 4,
-      fragLoadingRetryDelay: 1000,
+      enableWorker: true,
+      manifestLoadingTimeOut: 13_000,
+      manifestLoadingMaxRetry: 2,
+      fragLoadingMaxRetry: 6,
+      fragLoadingRetryDelay: 800,
       liveBackBufferLength: 0,
+      // Explicit default codecs — prevents bufferAddCodecError when HLS.js can't
+      // determine the codec from the first segment before creating the SourceBuffer.
+      // Hot51 streams are H.264/AVC video + AAC audio (confirmed from MPEG-TS PMT).
+      defaultAudioCodec: "mp4a.40.2",
       xhrSetup: (_xhr: XMLHttpRequest, xhrUrl: string) => {
         console.info("[LivePlayer] XHR →", xhrUrl.substring(0, 80));
       },
@@ -228,43 +207,39 @@ export default function LivePlayer({
     hls.loadSource(url);
     hls.attachMedia(el);
 
-    hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-      console.info("[LivePlayer] MEDIA_ATTACHED");
-    });
-
-    hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
-      console.info("[LivePlayer] MANIFEST_PARSED — levels:", data.levels?.length, "— play()");
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      console.info("[LivePlayer] MANIFEST_PARSED — play()");
       setState("playing");
       setMode("hls");
       el.play().catch((e) => console.warn("[LivePlayer] play() rejected:", e));
     });
 
     hls.on(Hls.Events.ERROR, (_event, data) => {
-      console.warn("[LivePlayer] HLS error:", data.details, "fatal:", data.fatal, "type:", data.type, data.error?.message ?? "");
+      console.warn("[LivePlayer] HLS error:", data.details, "fatal:", data.fatal, "type:", data.type);
       if (data.fatal) {
         destroyHls();
-        // bufferAddCodecError = MSE SourceBuffer.addSourceBuffer() failed — browser-side issue,
-        // NOT a network/CORS issue. Skip straight to Zego.
+        // bufferAddCodecError = MSE SourceBuffer.addSourceBuffer() failed — this is a
+        // browser-side codec/MSE issue, NOT a network/CORS issue. Retrying via proxy
+        // would give the same error. Skip straight to Zego fallback.
         if (data.details === Hls.ErrorDetails.BUFFER_ADD_CODEC_ERROR) {
-          console.info("[LivePlayer] bufferAddCodecError → MSE unavailable, skipping to Zego");
+          console.info("[LivePlayer] bufferAddCodecError → MSE unavailable in this browser, skipping to Zego");
           startZego();
           return;
         }
-        // For network/CORS/geo-block: try proxy first, then FLV (if not tried), then Zego
+        // For other fatal errors (network, CORS, geo-block): try proxy first, then FLV
         if (proxyFallbackRef.current && !proxyFallbackTriedRef.current) {
           proxyFallbackTriedRef.current = true;
-          hlsTriedRef.current = false; // reset so startHls can actually run HLS again with proxy URL
-          console.info("[LivePlayer] HLS direct fatal → retrying via proxy");
+          console.info("[LivePlayer] direct CDN fatal → retrying via proxy");
           startHls(proxyFallbackRef.current, el);
-        } else if (!flvTriedRef.current && streamUrl) {
-          const flvUrl = toAbsoluteUrl(streamUrl);
-          if (flvUrl.includes(".flv")) {
+        } else {
+          // streamUrl may be .m3u8 (same CDN); only try FLV if it looks like a real FLV URL
+          const flvUrl = streamUrl ? toAbsoluteUrl(streamUrl) : "";
+          const looksLikeFLV = flvUrl.includes(".flv") || flvUrl.includes("rtmp");
+          if (looksLikeFLV) {
             startFlv(flvUrl, el);
           } else {
             startZego();
           }
-        } else {
-          startZego();
         }
       } else {
         if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
@@ -276,10 +251,7 @@ export default function LivePlayer({
 
     el.onplaying = () => { setState("playing"); setMode("hls"); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hlsTriedRef, destroyAll, destroyHls, startFlv, startZego, streamUrl]);
-
-  // Keep startHlsRef current so startFlv's error handler can call it without circular dep
-  useEffect(() => { startHlsRef.current = startHls; }, [startHls]);
+  }, [hlsTriedRef, destroyAll, destroyHls, startFlv, streamUrl]);
 
   const tryProxy = useCallback(async (el: HTMLVideoElement) => {
     setState("loading");
@@ -308,6 +280,11 @@ export default function LivePlayer({
 
   /**
    * Wrap a Hot51 CDN URL through our server-side HLS proxy to bypass geo-blocking.
+   *
+   * IMPORTANT: always use ?room= (not ?url=) for Hot51 CDN streams when anchorId
+   * is available. CDN tokens (txSecret/txTime) expire in ~29s, and /api/live-rooms
+   * caches URLs for 20s. Using ?room= forces the backend to call Hot51 API fresh
+   * every time, ensuring the token is never stale.
    */
   function toHlsProxyUrl(url: string): string {
     const abs = toAbsoluteUrl(url);
@@ -321,56 +298,39 @@ export default function LivePlayer({
     return abs;
   }
 
-  const isHot51Cdn = (url: string) =>
-    url.includes("cdnsi.com") || url.includes("livcdn.com") || url.includes("baccdn.com");
-
   const startCdn = useCallback((el: HTMLVideoElement) => {
-    const rawFlv = streamUrl ? toAbsoluteUrl(streamUrl) : "";
-    const rawHls = hlsUrl ? toAbsoluteUrl(hlsUrl) : "";
-    const flvIsCdn = rawFlv && isHot51Cdn(rawFlv);
-    const hlsIsCdn = rawHls && isHot51Cdn(rawHls);
-
-    if (rawFlv && (rawFlv.endsWith(".flv") || rawFlv.includes(".flv?"))) {
-      // ── FLV-first: HTTP-FLV ~1-3s latency ──
-      // Always set HLS proxy as fallback for FLV failure
-      if (rawHls && rawHls.includes(".m3u8")) {
-        const hlsProxy = anchorId
+    const rawHls = hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null);
+    if (rawHls) {
+      const absUrl = toAbsoluteUrl(rawHls);
+      const isHot51Cdn = absUrl.includes("cdnsi.com") || absUrl.includes("livcdn.com") || absUrl.includes("baccdn.com");
+      if (isHot51Cdn && absUrl.includes(".m3u8")) {
+        // ComHub approach: load CDN URL directly — browser (Indonesia) → CDN (Indonesia), no latency overhead.
+        // Store proxy URL as fallback in case direct access is blocked by CORS or geo-filter.
+        proxyFallbackRef.current = anchorId
           ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
-          : (hlsIsCdn
-              ? `${BASE}/api/hls-proxy?url=${encodeURIComponent(rawHls)}`
-              : rawHls);
-        hlsFallbackRef.current = hlsProxy;
-        proxyFallbackRef.current = hlsProxy;
+          : `${BASE}/api/hls-proxy?url=${encodeURIComponent(absUrl)}`;
         proxyFallbackTriedRef.current = false;
-      } else {
-        hlsFallbackRef.current = "";
+        startHls(absUrl, el);
+        return;
       }
-
-      if (flvIsCdn && anchorId) {
-        // Hot51 CDN FLV: route through server-side stream-proxy to avoid 403/geo-block
-        const sp = `${BASE}/api/stream-proxy?roomId=${encodeURIComponent(roomId)}&anchorId=${encodeURIComponent(anchorId)}${liveId ? `&liveId=${encodeURIComponent(liveId)}` : ""}`;
-        console.info("[LivePlayer] FLV via stream-proxy:", sp.substring(0, 80));
-        startFlv(sp, el);
-      } else {
-        startFlv(rawFlv, el);
+      startHls(toHlsProxyUrl(rawHls), el);
+    } else if (streamUrl) {
+      const absUrl = toAbsoluteUrl(streamUrl);
+      const isCdn = absUrl.includes("cdnsi.com") || absUrl.includes("livcdn.com") || absUrl.includes("baccdn.com");
+      if (isCdn) {
+        const m = absUrl.match(/\/live\/\d+_([^_]+)_/);
+        if (m) {
+          const proxyUrl = `${BASE}/api/stream-proxy?roomId=${m[1]}`;
+          startFlv(toAbsoluteUrl(proxyUrl), el);
+          return;
+        }
       }
-    } else if (rawHls || (rawFlv && rawFlv.endsWith(".m3u8"))) {
-      // HLS-only stream (no FLV URL available)
-      const url = rawHls || rawFlv;
-      if (isHot51Cdn(url) && url.includes(".m3u8")) {
-        // Always use proxy for Hot51 CDN HLS — avoids 403 from expired tokens/geo-block
-        const proxyUrl = anchorId
-          ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
-          : `${BASE}/api/hls-proxy?url=${encodeURIComponent(url)}`;
-        startHls(proxyUrl, el);
-      } else {
-        startHls(toHlsProxyUrl(url), el);
-      }
+      startFlv(absUrl, el);
     } else {
       tryProxy(el);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hlsUrl, streamUrl, anchorId, liveId, roomId, startFlv, startHls, tryProxy]);
+  }, [hlsUrl, streamUrl, startHls, startFlv, tryProxy]);
 
   const handleZegoPlaying = useCallback(() => {
     setMode("zego");
@@ -416,7 +376,6 @@ export default function LivePlayer({
     activeHlsSourceRef.current = "";
     proxyFallbackRef.current = "";
     proxyFallbackTriedRef.current = false;
-    hlsFallbackRef.current = "";
     setZegoActive(false);
     setState("idle");
     setMode("none");
@@ -427,18 +386,22 @@ export default function LivePlayer({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  // When Feed.tsx refreshes hlsUrl every 20s, update the HLS source if currently playing HLS.
+  // When Feed.tsx refreshes hlsUrl every 20s (new signed CDN token), reload the HLS source.
+  // Prefer direct CDN URL (ComHub approach) — fastest path for Indonesian users.
+  // The proxy fallback is also updated so that if direct fails it retries with fresh token.
   useEffect(() => {
     if (!hlsRef.current || !hlsUrl) return;
     const absUrl = toAbsoluteUrl(hlsUrl);
-    const hot51 = absUrl.includes("cdnsi.com") || absUrl.includes("livcdn.com") || absUrl.includes("baccdn.com");
-    const newUrl = hot51 ? absUrl : (anchorId
+    const isHot51Cdn = absUrl.includes("cdnsi.com") || absUrl.includes("livcdn.com") || absUrl.includes("baccdn.com");
+    // Use same strategy as startCdn: direct CDN for Hot51 streams
+    const newUrl = isHot51Cdn ? absUrl : (anchorId
       ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
       : `${BASE}/api/hls-proxy?url=${encodeURIComponent(absUrl)}`);
     if (newUrl === activeHlsSourceRef.current) return;
     console.info("[LivePlayer] hlsUrl refreshed → reloading HLS source");
     activeHlsSourceRef.current = newUrl;
-    if (hot51) {
+    // Refresh the proxy fallback URL too (new token from live-rooms)
+    if (isHot51Cdn) {
       proxyFallbackRef.current = anchorId
         ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
         : `${BASE}/api/hls-proxy?url=${encodeURIComponent(absUrl)}`;
@@ -458,7 +421,6 @@ export default function LivePlayer({
     zegoTriedRef.current = false;
     hlsTriedRef.current = false;
     flvTriedRef.current = false;
-    hlsFallbackRef.current = "";
     setZegoActive(false);
     startedRef.current = false;
     setState("idle");
@@ -472,59 +434,6 @@ export default function LivePlayer({
   }
 
   const modeBadge = mode === "zego" ? "RTC" : mode === "hls" ? "HLS" : mode === "flv" ? "FLV" : "";
-  const loadingText = zegoActive
-    ? "Menghubungkan RTC…"
-    : mode === "flv"
-    ? "Memuat FLV…"
-    : mode === "hls"
-    ? "Memuat HLS…"
-    : "Menghubungkan…";
-
-  // FLV/HLS switcher: show whenever anchorId is available so user can switch between
-  // stream-proxy (FLV-style binary pipe) and hls-proxy (segment-based HLS).
-  // Not all rooms have a native .flv URL — Hot51 often only provides .m3u8 — so we
-  // derive FLV capability from the stream-proxy endpoint which always works for any room.
-  const flvUrl = streamUrl ? toAbsoluteUrl(streamUrl) : "";
-  const isNativeFLV = flvUrl.endsWith(".flv") || flvUrl.includes(".flv?");
-  const canFLV = isNativeFLV || !!anchorId; // stream-proxy works for any room with anchorId
-  const hasHLS = !!(hlsUrl ?? (streamUrl?.endsWith(".m3u8") ? streamUrl : null)) || !!anchorId;
-  const showSwitcher = canFLV && hasHLS && (state === "playing" || state === "loading") && mode !== "zego";
-
-  function handleSwitchMode(target: "flv" | "hls") {
-    if (!videoEl) return;
-    destroyAll();
-    try { videoEl.srcObject = null; } catch { /* ignore */ }
-    // Reset all tried-refs so the target format gets a clean attempt
-    flvTriedRef.current = false;
-    hlsTriedRef.current = false;
-    proxyFallbackTriedRef.current = false;
-
-    if (target === "flv") {
-      hlsFallbackRef.current = anchorId
-        ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
-        : (hlsUrl ? toAbsoluteUrl(hlsUrl) : "");
-      // Always use stream-proxy for CDN streams or when no native .flv URL
-      if (anchorId && (isHot51Cdn(flvUrl) || !isNativeFLV)) {
-        const sp = `${BASE}/api/stream-proxy?roomId=${encodeURIComponent(roomId)}&anchorId=${encodeURIComponent(anchorId)}${liveId ? `&liveId=${encodeURIComponent(liveId)}` : ""}`;
-        startFlv(sp, videoEl);
-      } else if (isNativeFLV) {
-        startFlv(flvUrl, videoEl);
-      }
-    } else {
-      const rawHls = hlsUrl
-        ? toAbsoluteUrl(hlsUrl)
-        : streamUrl?.replace(".flv", ".m3u8") ?? "";
-      if (isHot51Cdn(rawHls) && rawHls.includes(".m3u8")) {
-        // Always use proxy for Hot51 CDN HLS — avoids 403 from expired tokens/geo-block
-        const proxyUrl = anchorId
-          ? `${BASE}/api/hls-proxy?room=${encodeURIComponent(anchorId)}`
-          : `${BASE}/api/hls-proxy?url=${encodeURIComponent(rawHls)}`;
-        startHls(proxyUrl, videoEl);
-      } else if (rawHls) {
-        startHls(toHlsProxyUrl(rawHls), videoEl);
-      }
-    }
-  }
 
   return (
     <div ref={containerRef} className={`relative w-full h-full bg-black overflow-hidden ${className}`}>
@@ -550,7 +459,9 @@ export default function LivePlayer({
             className="w-9 h-9 rounded-full border-2 border-t-transparent animate-spin"
             style={{ borderColor: "#EE1D52 transparent transparent transparent" }}
           />
-          <p className="text-white/40 text-[10px]">{loadingText}</p>
+          <p className="text-white/40 text-[10px]">
+            {zegoActive ? "Menghubungkan RTC…" : mode === "hls" ? "Memuat HLS…" : "Memuat stream…"}
+          </p>
         </div>
       )}
 
@@ -606,38 +517,8 @@ export default function LivePlayer({
               </svg>
             )}
           </button>
-
-          {/* FLV / HLS manual switcher */}
-          {showSwitcher ? (
-            <div
-              className="flex rounded-full overflow-hidden"
-              style={{ border: "1px solid rgba(255,255,255,0.18)", background: "rgba(0,0,0,0.55)", backdropFilter: "blur(6px)" }}
-            >
-              <button
-                onClick={() => handleSwitchMode("flv")}
-                title="HTTP-FLV — latensi rendah ~1-3 detik"
-                className="px-2 py-[3px] text-[8px] font-mono font-bold transition-colors active:opacity-70"
-                style={mode === "flv"
-                  ? { background: "#EE1D52", color: "#fff" }
-                  : { color: "rgba(255,255,255,0.45)" }}
-              >
-                FLV
-              </button>
-              <button
-                onClick={() => handleSwitchMode("hls")}
-                title="HLS M3U8 — kompatibel & adaptif"
-                className="px-2 py-[3px] text-[8px] font-mono font-bold transition-colors active:opacity-70"
-                style={mode === "hls"
-                  ? { background: "#EE1D52", color: "#fff" }
-                  : { color: "rgba(255,255,255,0.45)" }}
-              >
-                HLS
-              </button>
-            </div>
-          ) : (
-            modeBadge && (
-              <span className="text-[9px] text-white/60 font-mono">{modeBadge}</span>
-            )
+          {modeBadge && (
+            <span className="text-[9px] text-white/60 font-mono">{modeBadge}</span>
           )}
         </div>
       )}
