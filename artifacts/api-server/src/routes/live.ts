@@ -2262,69 +2262,86 @@ liveRouter.get("/cdn-test", async (req: Request, res: Response) => {
   });
 });
 
-/** GET /api/gifts — daftar gift dari HOT51 */
+/** GET /api/gifts — daftar gift dari HOT51
+ *  Primary: POST /plr/gift/package/list with empty body (matches real APK traffic capture)
+ *  Fallback: other known gift list endpoints
+ */
 liveRouter.get("/gifts", async (_req: Request, res: Response) => {
-  // Gift list endpoints — try GET first (as seen in APK traffic capture), then POST fallback
-  const getEndpoints = [
-    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList}?merchantId=${MERCHANT_ID}`),
-    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList2}?merchantId=${MERCHANT_ID}`),
-    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getPackageGiftList}?merchantId=${MERCHANT_ID}`),
-  ];
-  for (const url of getEndpoints) {
-    try {
-      const raw = await hotFetch(url, { method: "GET", headers: getGuestGetHeaders(url), timeoutMs: 10_000 });
-      const d = raw as Record<string, unknown>;
-      if (d?.code === 200 || d?.code === "200") {
-        const inner = d.data;
-        // Normalize: extract list from various response shapes
-        const list = Array.isArray(inner) ? inner
-          : Array.isArray((inner as Record<string, unknown>)?.list) ? (inner as Record<string, unknown>).list
-          : Array.isArray((inner as Record<string, unknown>)?.records) ? (inner as Record<string, unknown>).records
-          : null;
-        if (list && (list as unknown[]).length > 0) {
-          res.json({ success: true, data: raw, list });
-          return;
-        }
-      }
-    } catch { continue; }
-  }
-  // Fallback: try POST
-  const postEndpoints = [
+  // Helper: extract normalized list from various Hot51 response shapes
+  const extractList = (d: Record<string, unknown>): unknown[] | null => {
+    const inner = d?.data ?? d;
+    return Array.isArray(inner) ? inner
+      : Array.isArray((inner as Record<string, unknown>)?.list) ? (inner as Record<string, unknown>).list as unknown[]
+      : Array.isArray((inner as Record<string, unknown>)?.records) ? (inner as Record<string, unknown>).records as unknown[]
+      : null;
+  };
+
+  // Priority 1: POST /plr/gift/package/list with empty body — matches real APK traffic
+  try {
+    const url = withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getPackageGiftList}`);
+    const raw = await hotFetch(url, { method: "POST", headers: getPostHeaders("{}"), body: "{}", timeoutMs: 8_000 });
+    const d = raw as Record<string, unknown>;
+    const list = extractList(d);
+    if (list && list.length > 0) {
+      res.json({ success: true, data: raw, list });
+      return;
+    }
+  } catch { /* fall through */ }
+
+  // Priority 2: other POST endpoints
+  const postFallbacks = [
     `${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList}`,
     `${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList2}`,
   ];
-  for (const url of postEndpoints) {
+  for (const url of postFallbacks) {
     try {
       const raw = await hotFetch(withTimestamp(url), { method: "POST", headers: getPostHeaders("{}"), body: "{}", timeoutMs: 8_000 });
       const d = raw as Record<string, unknown>;
-      const inner = d?.data ?? d;
-      const list = Array.isArray(inner) ? inner
-        : Array.isArray((inner as Record<string, unknown>)?.list) ? (inner as Record<string, unknown>).list
-        : null;
-      if (list && (list as unknown[]).length > 0) {
+      const list = extractList(d);
+      if (list && list.length > 0) {
         res.json({ success: true, data: raw, list });
         return;
       }
     } catch { continue; }
   }
+
+  // Priority 3: GET fallbacks
+  const getEndpoints = [
+    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList}?merchantId=${MERCHANT_ID}`),
+    withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.getGiftList2}?merchantId=${MERCHANT_ID}`),
+  ];
+  for (const url of getEndpoints) {
+    try {
+      const raw = await hotFetch(url, { method: "GET", headers: getGuestGetHeaders(url), timeoutMs: 8_000 });
+      const d = raw as Record<string, unknown>;
+      const list = extractList(d);
+      if (list && list.length > 0) {
+        res.json({ success: true, data: raw, list });
+        return;
+      }
+    } catch { continue; }
+  }
+
   res.json({ success: false, error: "Tidak bisa memuat daftar gift", data: null, list: null });
 });
 
-/** POST /api/send-gift — kirim gift ke anchor { anchorId, liveId, giftId, giftNum, giftName? } */
+/** POST /api/send-gift — kirim gift ke anchor { anchorId, giftId, giftNum, giftName? }
+ *  Body matches real APK traffic: { giftId, anchorId, area, giftNum }
+ *  liveId is accepted but ignored (real APK does not send it)
+ */
 liveRouter.post("/send-gift", async (req: Request, res: Response) => {
-  const { anchorId, liveId, giftId, giftNum = 1, giftName: clientGiftName } = req.body ?? {};
-  if (!anchorId || !liveId || !giftId) {
-    res.status(400).json({ success: false, error: "Perlu anchorId, liveId, dan giftId" });
+  const { anchorId, giftId, giftNum = 1, giftName: clientGiftName } = req.body ?? {};
+  if (!anchorId || !giftId) {
+    res.status(400).json({ success: false, error: "Perlu anchorId dan giftId" });
     return;
   }
 
   const num = Number(giftNum) || 1;
-  const bodyObj = { anchorId, liveId, giftId, giftNum: num, merchantId: Number(MERCHANT_ID) };
-  const bodyStr = JSON.stringify(bodyObj);
+  // Body matches real APK capture: {giftId, anchorId, area, giftNum} — no liveId, no merchantId
+  const bodyStr = JSON.stringify({ giftId, anchorId, area: session?.area ?? "ID", giftNum: num });
 
   const endpoints = [
-    { url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.sendGift}`),        body: bodyStr },
-    { url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.sendPackageGift}`), body: JSON.stringify({ ...bodyObj, packageId: giftId }) },
+    { url: withTimestamp(`${HOT51_BASE}/${MERCHANT_ID}/api${API.sendGift}`), body: bodyStr },
   ];
 
   for (const ep of endpoints) {
